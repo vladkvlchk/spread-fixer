@@ -3,7 +3,7 @@
 import { useEffect, useRef } from "react";
 import Image from "next/image";
 import Link from "next/link";
-import { useMarkets } from "./hooks";
+import { useMarkets, type Strategy } from "./hooks";
 import { Spinner } from "@/components/ui/spinner";
 
 function formatDate(dateString: string) {
@@ -18,9 +18,10 @@ type Props = {
   query?: string;
   order?: string;
   tagSlug?: string;
+  strategy?: string;
 };
 
-export function MarketsGrid({ query, order, tagSlug }: Props) {
+export function MarketsGrid({ query, order, tagSlug, strategy }: Props) {
   const {
     data: markets,
     isLoading,
@@ -28,7 +29,7 @@ export function MarketsGrid({ query, order, tagSlug }: Props) {
     hasNextPage,
     fetchNextPage,
     isFetchingNextPage,
-  } = useMarkets({ query, order, tagSlug });
+  } = useMarkets({ query, order, tagSlug, strategy: strategy as Strategy });
 
   const loadMoreRef = useRef<HTMLDivElement>(null);
 
@@ -139,7 +140,13 @@ export function MarketsGrid({ query, order, tagSlug }: Props) {
                     <span>${Math.round(parseFloat(market.volume || "0")).toLocaleString()} vol</span>
                     <span>(${Math.round(market.volume24hr || 0).toLocaleString()} 24h)</span>
                   </div>
-                  <div>Ends {formatDate(market.endDate)}</div>
+                  {strategy === "spread-finder" && market.spread > 0 ? (
+                    <div className="px-2 py-0.5 rounded bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 font-semibold">
+                      {(market.spread * 100).toFixed(1)}% spread
+                    </div>
+                  ) : (
+                    <div>Ends {formatDate(market.endDate)}</div>
+                  )}
                 </div>
               </div>
             </Link>

@@ -5,11 +5,11 @@ import { MarketsGrid } from "./markets-grid";
 import { Filters } from "./filters";
 
 type Props = {
-  searchParams: Promise<{ q?: string; order?: string; tag_slug?: string }>;
+  searchParams: Promise<{ q?: string; order?: string; tag_slug?: string; strategy?: string }>;
 };
 
 export default async function PolymarketPage({ searchParams }: Props) {
-  const { q, order, tag_slug } = await searchParams;
+  const { q, order, tag_slug, strategy } = await searchParams;
 
   return (
     <main className="min-h-screen bg-neutral-50 dark:bg-neutral-950 p-6 md:p-12">
@@ -39,7 +39,7 @@ export default async function PolymarketPage({ searchParams }: Props) {
           </Suspense>
         </header>
 
-        <MarketsGrid query={q} order={order} tagSlug={tag_slug} />
+        <MarketsGrid query={q} order={order} tagSlug={tag_slug} strategy={strategy} />
       </div>
     </main>
   );
