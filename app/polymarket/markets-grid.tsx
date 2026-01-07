@@ -140,7 +140,7 @@ export function MarketsGrid({ query, order, tagSlug, strategy }: Props) {
                     <span>${Math.round(parseFloat(market.volume || "0")).toLocaleString()} vol</span>
                     <span>(${Math.round(market.volume24hr || 0).toLocaleString()} 24h)</span>
                   </div>
-                  {strategy === "spread-finder" && market.spread > 0 ? (
+                  {(strategy === "spread-finder" || strategy === "smallest-spread") && market.spread > 0 ? (
                     <div className="px-2 py-0.5 rounded bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 font-semibold">
                       {(market.spread * 100).toFixed(1)}% spread
                     </div>

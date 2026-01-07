@@ -111,7 +111,7 @@ async function searchMarketsApi(query: string): Promise<Market[]> {
   );
 }
 
-export type Strategy = "spread-finder" | null;
+export type Strategy = "spread-finder" | "smallest-spread" | null;
 
 type UseMarketsOptions = {
   query?: string;
@@ -132,16 +132,20 @@ export function useMarkets(opts: UseMarketsOptions = {}) {
     staleTime: 30 * 1000,
   });
 
-  // Strategy: Spread Finder - fetch all and sort by spread
+  // Strategy queries - fetch all and sort
   const strategyQuery = useQuery({
     queryKey: ["markets-strategy", strategy, tagSlug || ""],
     queryFn: async () => {
       const markets = await fetchAllMarkets(tagSlug);
+      const withSpread = markets.filter((m) => m.spread > 0);
+
       if (strategy === "spread-finder") {
         // Sort by spread descending (highest spread first)
-        return markets
-          .filter((m) => m.spread > 0)
-          .sort((a, b) => b.spread - a.spread);
+        return withSpread.sort((a, b) => b.spread - a.spread);
+      }
+      if (strategy === "smallest-spread") {
+        // Sort by spread ascending (lowest spread first)
+        return withSpread.sort((a, b) => a.spread - b.spread);
       }
       return markets;
     },

@@ -23,6 +23,7 @@ const CATEGORIES = [
 
 const STRATEGIES = [
   { label: "Biggest Spread", value: "spread-finder", description: "Find markets with highest spreads" },
+  { label: "Smallest Spread", value: "smallest-spread", description: "Find markets with lowest spreads" },
 ] as const;
 
 function buildHref(params: { order?: string; tag_slug?: string; strategy?: string }) {
