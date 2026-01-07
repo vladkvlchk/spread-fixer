@@ -1,20 +1,10 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { useMarkets } from "./hooks";
 import { Spinner } from "@/components/ui/spinner";
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationLink,
-  PaginationNext,
-  PaginationPrevious,
-  PaginationEllipsis,
-} from "@/components/ui/pagination";
-
-const PER_PAGE = 12;
 
 function formatDate(dateString: string) {
   return new Date(dateString).toLocaleDateString("en-US", {
@@ -24,29 +14,40 @@ function formatDate(dateString: string) {
   });
 }
 
-function getPageNumbers(current: number, total: number): (number | "ellipsis")[] {
-  const pages: (number | "ellipsis")[] = [];
-  if (total <= 7) {
-    for (let i = 1; i <= total; i++) pages.push(i);
-    return pages;
-  }
-  pages.push(1);
-  if (current > 3) pages.push("ellipsis");
-  const start = Math.max(2, current - 1);
-  const end = Math.min(total - 1, current + 1);
-  for (let i = start; i <= end; i++) pages.push(i);
-  if (current < total - 2) pages.push("ellipsis");
-  pages.push(total);
-  return pages;
-}
-
 type Props = {
   query?: string;
-  page: number;
+  order?: string;
+  tagSlug?: string;
 };
 
-export function MarketsGrid({ query, page }: Props) {
-  const { data: allMarkets, isLoading, error } = useMarkets(query);
+export function MarketsGrid({ query, order, tagSlug }: Props) {
+  const {
+    data: markets,
+    isLoading,
+    error,
+    hasNextPage,
+    fetchNextPage,
+    isFetchingNextPage,
+  } = useMarkets({ query, order, tagSlug });
+
+  const loadMoreRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = loadMoreRef.current;
+    if (!el || !hasNextPage) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasNextPage && !isFetchingNextPage) {
+          fetchNextPage();
+        }
+      },
+      { threshold: 0.1 }
+    );
+
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasNextPage, fetchNextPage, isFetchingNextPage]);
 
   if (isLoading) {
     return (
@@ -65,7 +66,7 @@ export function MarketsGrid({ query, page }: Props) {
     );
   }
 
-  if (!allMarkets || allMarkets.length === 0) {
+  if (!markets || markets.length === 0) {
     return (
       <div className="text-center py-24 text-neutral-500">
         No markets found
@@ -73,26 +74,11 @@ export function MarketsGrid({ query, page }: Props) {
     );
   }
 
-  const totalPages = Math.ceil(allMarkets.length / PER_PAGE);
-  const currentPage = Math.min(Math.max(1, page), totalPages);
-  const markets = allMarkets.slice(
-    (currentPage - 1) * PER_PAGE,
-    currentPage * PER_PAGE
-  );
-
-  function pageHref(p: number) {
-    const params = new URLSearchParams();
-    if (p > 1) params.set("page", String(p));
-    if (query) params.set("q", query);
-    const qs = params.toString();
-    return qs ? `/polymarket?${qs}` : "/polymarket";
-  }
-
   return (
     <>
       {query && (
         <p className="text-sm text-neutral-600 dark:text-neutral-400 mb-6">
-          {allMarkets.length} results for &quot;{query}&quot;
+          {markets.length} results for &quot;{query}&quot;
         </p>
       )}
 
@@ -148,7 +134,11 @@ export function MarketsGrid({ query, page }: Props) {
                   </div>
                 </div>
 
-                <div className="flex items-center justify-end text-xs font-medium text-neutral-500 dark:text-neutral-500 pt-4 border-t border-neutral-100 dark:border-neutral-800">
+                <div className="flex items-center justify-between text-xs font-medium text-neutral-500 dark:text-neutral-500 pt-4 border-t border-neutral-100 dark:border-neutral-800">
+                  <div className="flex gap-3">
+                    <span>${Math.round(parseFloat(market.volume || "0")).toLocaleString()} vol</span>
+                    <span>(${Math.round(market.volume24hr || 0).toLocaleString()} 24h)</span>
+                  </div>
                   <div>Ends {formatDate(market.endDate)}</div>
                 </div>
               </div>
@@ -157,43 +147,15 @@ export function MarketsGrid({ query, page }: Props) {
         })}
       </div>
 
-      {totalPages > 1 && (
-        <div className="mt-12">
-          <Pagination>
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  href={pageHref(Math.max(1, currentPage - 1))}
-                  aria-disabled={currentPage === 1}
-                  className={currentPage === 1 ? "pointer-events-none opacity-50" : ""}
-                />
-              </PaginationItem>
-
-              {getPageNumbers(currentPage, totalPages).map((p, i) =>
-                p === "ellipsis" ? (
-                  <PaginationItem key={`ellipsis-${i}`}>
-                    <PaginationEllipsis />
-                  </PaginationItem>
-                ) : (
-                  <PaginationItem key={p}>
-                    <PaginationLink href={pageHref(p)} isActive={p === currentPage}>
-                      {p}
-                    </PaginationLink>
-                  </PaginationItem>
-                )
-              )}
-
-              <PaginationItem>
-                <PaginationNext
-                  href={pageHref(Math.min(totalPages, currentPage + 1))}
-                  aria-disabled={currentPage === totalPages}
-                  className={currentPage === totalPages ? "pointer-events-none opacity-50" : ""}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
-        </div>
-      )}
+      {/* Infinite scroll trigger */}
+      <div ref={loadMoreRef} className="py-8 flex justify-center">
+        {isFetchingNextPage && (
+          <Spinner className="size-6 text-neutral-400" />
+        )}
+        {!hasNextPage && markets.length > 0 && (
+          <p className="text-sm text-neutral-500">No more markets</p>
+        )}
+      </div>
     </>
   );
 }

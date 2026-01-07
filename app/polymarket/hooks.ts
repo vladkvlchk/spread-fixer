@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
 
 export type Market = {
   id: string;
@@ -49,9 +49,23 @@ type PricePoint = {
   p: number;
 };
 
+type FetchOptions = {
+  offset?: number;
+  limit?: number;
+  order?: string;
+  tagSlug?: string;
+};
+
 // Fetch markets via local API proxy
-async function fetchMarkets(offset = 0, limit = 50) {
-  const res = await fetch(`/api/polymarket/markets?offset=${offset}&limit=${limit}`);
+async function fetchMarkets(opts: FetchOptions = {}) {
+  const { offset = 0, limit = 50, order, tagSlug } = opts;
+  const params = new URLSearchParams();
+  params.set("offset", String(offset));
+  params.set("limit", String(limit));
+  if (order) params.set("order", order);
+  if (tagSlug) params.set("tag_slug", tagSlug);
+
+  const res = await fetch(`/api/polymarket/markets?${params}`);
   if (!res.ok) throw new Error("Failed to fetch markets");
 
   const json = await res.json();
@@ -65,20 +79,7 @@ async function fetchMarkets(offset = 0, limit = 50) {
   return { markets, hasMore: json.pagination?.hasMore ?? false };
 }
 
-async function fetchAllMarkets(): Promise<Market[]> {
-  const allMarkets: Market[] = [];
-  let offset = 0;
-  const limit = 50;
-
-  for (let i = 0; i < 10; i++) {
-    const { markets, hasMore } = await fetchMarkets(offset, limit);
-    allMarkets.push(...markets);
-    if (!hasMore) break;
-    offset += limit;
-  }
-
-  return allMarkets;
-}
+const PAGE_SIZE = 20;
 
 async function searchMarketsApi(query: string): Promise<Market[]> {
   const res = await fetch(`/api/polymarket/markets?q=${encodeURIComponent(query)}`);
@@ -94,13 +95,61 @@ async function searchMarketsApi(query: string): Promise<Market[]> {
   );
 }
 
+type UseMarketsOptions = {
+  query?: string;
+  order?: string;
+  tagSlug?: string;
+};
+
 // Hooks
-export function useMarkets(query?: string) {
-  return useQuery({
-    queryKey: ["markets", query || "all"],
-    queryFn: () => (query ? searchMarketsApi(query) : fetchAllMarkets()),
+export function useMarkets(opts: UseMarketsOptions = {}) {
+  const { query, order, tagSlug } = opts;
+
+  // Search uses regular query (no pagination from API)
+  const searchQuery = useQuery({
+    queryKey: ["markets-search", query],
+    queryFn: () => searchMarketsApi(query!),
+    enabled: !!query,
     staleTime: 30 * 1000,
   });
+
+  // Browse uses infinite query
+  const infiniteQuery = useInfiniteQuery({
+    queryKey: ["markets-infinite", order || "volume24hr", tagSlug || ""],
+    queryFn: async ({ pageParam = 0 }) => {
+      const { markets, hasMore } = await fetchMarkets({
+        offset: pageParam,
+        limit: PAGE_SIZE,
+        order,
+        tagSlug,
+      });
+      return { markets, hasMore, nextOffset: pageParam + PAGE_SIZE };
+    },
+    initialPageParam: 0,
+    getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextOffset : undefined),
+    enabled: !query,
+    staleTime: 30 * 1000,
+  });
+
+  if (query) {
+    return {
+      data: searchQuery.data,
+      isLoading: searchQuery.isLoading,
+      error: searchQuery.error,
+      hasNextPage: false,
+      fetchNextPage: () => {},
+      isFetchingNextPage: false,
+    };
+  }
+
+  return {
+    data: infiniteQuery.data?.pages.flatMap((p) => p.markets),
+    isLoading: infiniteQuery.isLoading,
+    error: infiniteQuery.error,
+    hasNextPage: infiniteQuery.hasNextPage,
+    fetchNextPage: infiniteQuery.fetchNextPage,
+    isFetchingNextPage: infiniteQuery.isFetchingNextPage,
+  };
 }
 
 export function useMarket(id: string) {

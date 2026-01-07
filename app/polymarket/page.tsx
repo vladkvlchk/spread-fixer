@@ -2,14 +2,14 @@ import Link from "next/link";
 import { Suspense } from "react";
 import { SearchInput } from "./search";
 import { MarketsGrid } from "./markets-grid";
+import { Filters } from "./filters";
 
 type Props = {
-  searchParams: Promise<{ page?: string; q?: string }>;
+  searchParams: Promise<{ q?: string; order?: string; tag_slug?: string }>;
 };
 
 export default async function PolymarketPage({ searchParams }: Props) {
-  const { page, q } = await searchParams;
-  const currentPage = Math.max(1, parseInt(page || "1", 10));
+  const { q, order, tag_slug } = await searchParams;
 
   return (
     <main className="min-h-screen bg-neutral-50 dark:bg-neutral-950 p-6 md:p-12">
@@ -33,9 +33,13 @@ export default async function PolymarketPage({ searchParams }: Props) {
               </Suspense>
             </div>
           </div>
+
+          <Suspense fallback={null}>
+            <Filters />
+          </Suspense>
         </header>
 
-        <MarketsGrid query={q} page={currentPage} />
+        <MarketsGrid query={q} order={order} tagSlug={tag_slug} />
       </div>
     </main>
   );

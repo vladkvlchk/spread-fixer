@@ -7,6 +7,8 @@ export async function GET(request: NextRequest) {
   const offset = searchParams.get("offset") || "0";
   const limit = searchParams.get("limit") || "50";
   const q = searchParams.get("q");
+  const tagSlug = searchParams.get("tag_slug");
+  const order = searchParams.get("order") || "volume24hr";
 
   try {
     if (q) {
@@ -28,10 +30,14 @@ export async function GET(request: NextRequest) {
       url.searchParams.set("active", "true");
       url.searchParams.set("archived", "false");
       url.searchParams.set("closed", "false");
-      url.searchParams.set("order", "volume24hr");
+      url.searchParams.set("order", order);
       url.searchParams.set("ascending", "false");
       url.searchParams.set("limit", limit);
       url.searchParams.set("offset", offset);
+
+      if (tagSlug) {
+        url.searchParams.set("tag_slug", tagSlug);
+      }
 
       const res = await fetch(url.toString());
       if (!res.ok) {
