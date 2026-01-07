@@ -111,7 +111,8 @@ export default async function PolymarketPage({ searchParams }: Props) {
             const img = market.image || market.icon;
 
             return (
-              <div
+              <Link
+                href={`/polymarket/${market.id}`}
                 key={market.id || index}
                 className="group relative flex flex-col bg-white dark:bg-neutral-900 rounded-2xl border border-neutral-200 dark:border-neutral-800 p-5 hover:shadow-xl hover:border-neutral-300 dark:hover:border-neutral-700 transition-all duration-300 ease-out"
               >
@@ -157,7 +158,7 @@ export default async function PolymarketPage({ searchParams }: Props) {
                     <div>Ends {formatDate(market.endDate)}</div>
                   </div>
                 </div>
-              </div>
+              </Link>
             );
           })}
         </div>
