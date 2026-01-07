@@ -39,7 +39,7 @@ export function Filters() {
   const currentTagSlug = searchParams.get("tag_slug") || "";
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 flex justify-between">
       {/* Sort buttons */}
       <div className="flex flex-wrap gap-2">
         {SORT_OPTIONS.map((opt) => (
@@ -65,7 +65,7 @@ export function Filters() {
             key={cat.value}
             href={buildHref({ order: currentOrder, tag_slug: cat.value })}
             className={cn(
-              "px-3 py-1.5 rounded-lg text-sm font-medium transition-colors border",
+              "px-3 py-1.5 rounded-lg text-sm font-medium transition-colors border h-fit",
               currentTagSlug === cat.value
                 ? "border-blue-600 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-400"
                 : "border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-400 hover:border-neutral-300 dark:hover:border-neutral-600"
