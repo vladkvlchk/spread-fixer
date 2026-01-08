@@ -31,7 +31,11 @@ export type Event = {
   slug: string;
   endDate: string;
   image: string;
+  icon?: string;
   markets: Market[];
+  volume: number;
+  volume24hr: number;
+  liquidity: number;
 };
 
 type OrderBookEntry = {
@@ -56,8 +60,8 @@ type FetchOptions = {
   tagSlug?: string;
 };
 
-// Fetch markets via local API proxy
-async function fetchMarkets(opts: FetchOptions = {}) {
+// Fetch events via local API proxy
+async function fetchEvents(opts: FetchOptions = {}) {
   const { offset = 0, limit = 50, order, tagSlug } = opts;
   const params = new URLSearchParams();
   params.set("offset", String(offset));
@@ -66,85 +70,113 @@ async function fetchMarkets(opts: FetchOptions = {}) {
   if (tagSlug) params.set("tag_slug", tagSlug);
 
   const res = await fetch(`/api/polymarket/markets?${params}`);
-  if (!res.ok) throw new Error("Failed to fetch markets");
+  if (!res.ok) throw new Error("Failed to fetch events");
 
   const json = await res.json();
-  const markets = json.data.flatMap((event: Event) =>
-    event.markets.filter(
-      (m: Market) =>
-        m.active && !m.closed && m.acceptingOrders && m.outcomes && m.outcomePrices
+  // Filter events that have active markets
+  const events = (json.data as Event[]).filter((event) =>
+    event.markets.some(
+      (m) => m.active && !m.closed && m.acceptingOrders && m.outcomes && m.outcomePrices
     )
-  );
+  ).map((event) => ({
+    ...event,
+    // Keep only active markets within each event
+    markets: event.markets.filter(
+      (m) => m.active && !m.closed && m.acceptingOrders && m.outcomes && m.outcomePrices
+    ),
+  }));
 
-  return { markets, hasMore: json.pagination?.hasMore ?? false };
+  return { events, hasMore: json.pagination?.hasMore ?? false };
 }
 
 const PAGE_SIZE = 20;
 
-// Fetch all markets for strategies (loads all pages)
-async function fetchAllMarkets(tagSlug?: string): Promise<Market[]> {
-  const allMarkets: Market[] = [];
+// Fetch all events for strategies (loads all pages)
+async function fetchAllEvents(tagSlug?: string): Promise<Event[]> {
+  const allEvents: Event[] = [];
   let offset = 0;
   const limit = 100;
 
   for (let i = 0; i < 20; i++) {
-    const { markets, hasMore } = await fetchMarkets({ offset, limit, tagSlug });
-    allMarkets.push(...markets);
+    const { events, hasMore } = await fetchEvents({ offset, limit, tagSlug });
+    allEvents.push(...events);
     if (!hasMore) break;
     offset += limit;
   }
 
-  return allMarkets;
+  return allEvents;
 }
 
-async function searchMarketsApi(query: string): Promise<Market[]> {
+// Extract all markets from events (for strategies that sort by market properties)
+function flattenEventsToMarkets(events: Event[]): Market[] {
+  return events.flatMap((event) => event.markets);
+}
+
+async function searchEventsApi(query: string): Promise<Event[]> {
   const res = await fetch(`/api/polymarket/markets?q=${encodeURIComponent(query)}`);
   if (!res.ok) return [];
 
   const json = await res.json();
   const events = (json.events || []) as Event[];
 
-  return events.flatMap((event) =>
-    event.markets.filter(
-      (m) => m.active && !m.closed && m.acceptingOrders && m.outcomes && m.outcomePrices
+  return events
+    .filter((event) =>
+      event.markets.some(
+        (m) => m.active && !m.closed && m.acceptingOrders && m.outcomes && m.outcomePrices
+      )
     )
-  );
+    .map((event) => ({
+      ...event,
+      markets: event.markets.filter(
+        (m) => m.active && !m.closed && m.acceptingOrders && m.outcomes && m.outcomePrices
+      ),
+    }));
 }
 
 export type Strategy = "spread-finder" | "smallest-spread" | null;
 
-type UseMarketsOptions = {
+type UseEventsOptions = {
   query?: string;
   order?: string;
   tagSlug?: string;
   strategy?: Strategy;
 };
 
+type UseEventsResult = {
+  events?: Event[];
+  markets?: Market[];  // Only for strategy mode
+  isLoading: boolean;
+  error: Error | null;
+  hasNextPage: boolean;
+  fetchNextPage: () => void;
+  isFetchingNextPage: boolean;
+  mode: "events" | "markets";
+};
+
 // Hooks
-export function useMarkets(opts: UseMarketsOptions = {}) {
+export function useEvents(opts: UseEventsOptions = {}): UseEventsResult {
   const { query, order, tagSlug, strategy } = opts;
 
-  // Search uses regular query (no pagination from API)
+  // Search uses regular query
   const searchQuery = useQuery({
-    queryKey: ["markets-search", query],
-    queryFn: () => searchMarketsApi(query!),
+    queryKey: ["events-search", query],
+    queryFn: () => searchEventsApi(query!),
     enabled: !!query && !strategy,
     staleTime: 30 * 1000,
   });
 
-  // Strategy queries - fetch all and sort
+  // Strategy queries - fetch all markets and sort by spread
   const strategyQuery = useQuery({
     queryKey: ["markets-strategy", strategy, tagSlug || ""],
     queryFn: async () => {
-      const markets = await fetchAllMarkets(tagSlug);
+      const events = await fetchAllEvents(tagSlug);
+      const markets = flattenEventsToMarkets(events);
       const withSpread = markets.filter((m) => m.spread > 0);
 
       if (strategy === "spread-finder") {
-        // Sort by spread descending (highest spread first)
         return withSpread.sort((a, b) => b.spread - a.spread);
       }
       if (strategy === "smallest-spread") {
-        // Sort by spread ascending (lowest spread first)
         return withSpread.sort((a, b) => a.spread - b.spread);
       }
       return markets;
@@ -153,17 +185,17 @@ export function useMarkets(opts: UseMarketsOptions = {}) {
     staleTime: 30 * 1000,
   });
 
-  // Browse uses infinite query
+  // Browse uses infinite query for events
   const infiniteQuery = useInfiniteQuery({
-    queryKey: ["markets-infinite", order || "volume24hr", tagSlug || ""],
+    queryKey: ["events-infinite", order || "volume24hr", tagSlug || ""],
     queryFn: async ({ pageParam = 0 }) => {
-      const { markets, hasMore } = await fetchMarkets({
+      const { events, hasMore } = await fetchEvents({
         offset: pageParam,
         limit: PAGE_SIZE,
         order,
         tagSlug,
       });
-      return { markets, hasMore, nextOffset: pageParam + PAGE_SIZE };
+      return { events, hasMore, nextOffset: pageParam + PAGE_SIZE };
     },
     initialPageParam: 0,
     getNextPageParam: (lastPage) => (lastPage.hasMore ? lastPage.nextOffset : undefined),
@@ -171,38 +203,66 @@ export function useMarkets(opts: UseMarketsOptions = {}) {
     staleTime: 30 * 1000,
   });
 
-  // Strategy mode
+  // Strategy mode - returns markets
   if (strategy && !query) {
     return {
-      data: strategyQuery.data,
+      markets: strategyQuery.data,
       isLoading: strategyQuery.isLoading,
       error: strategyQuery.error,
       hasNextPage: false,
       fetchNextPage: () => {},
       isFetchingNextPage: false,
+      mode: "markets",
     };
   }
 
-  // Search mode
+  // Search mode - returns events
   if (query) {
     return {
-      data: searchQuery.data,
+      events: searchQuery.data,
       isLoading: searchQuery.isLoading,
       error: searchQuery.error,
       hasNextPage: false,
       fetchNextPage: () => {},
       isFetchingNextPage: false,
+      mode: "events",
     };
   }
 
-  // Browse mode (infinite scroll)
+  // Browse mode - returns events
   return {
-    data: infiniteQuery.data?.pages.flatMap((p) => p.markets),
+    events: infiniteQuery.data?.pages.flatMap((p) => p.events),
     isLoading: infiniteQuery.isLoading,
     error: infiniteQuery.error,
     hasNextPage: infiniteQuery.hasNextPage,
     fetchNextPage: infiniteQuery.fetchNextPage,
     isFetchingNextPage: infiniteQuery.isFetchingNextPage,
+    mode: "events",
+  };
+}
+
+// Keep old hook for backward compatibility (deprecated)
+export function useMarkets(opts: UseEventsOptions = {}) {
+  const result = useEvents(opts);
+  // For strategies, return markets directly
+  if (result.mode === "markets") {
+    return {
+      data: result.markets,
+      isLoading: result.isLoading,
+      error: result.error,
+      hasNextPage: result.hasNextPage,
+      fetchNextPage: result.fetchNextPage,
+      isFetchingNextPage: result.isFetchingNextPage,
+    };
+  }
+  // For events mode, flatten to markets (old behavior)
+  return {
+    data: result.events?.flatMap((e) => e.markets),
+    isLoading: result.isLoading,
+    error: result.error,
+    hasNextPage: result.hasNextPage,
+    fetchNextPage: result.fetchNextPage,
+    isFetchingNextPage: result.isFetchingNextPage,
   };
 }
 
