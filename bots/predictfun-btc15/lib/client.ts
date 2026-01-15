@@ -96,19 +96,37 @@ export async function createClient(): Promise<PredictClient> {
   });
 
   const getActiveMarket = async (): Promise<Market | null> => {
-    const res = await fetchWithProxy(`${API_BASE}/markets?first=150`, {
-      headers: getHeaders(),
-    });
-    const data = await res.json() as { success: boolean; data?: Market[] };
-    if (!data.success) return null;
+    let cursor: string | null = null;
 
-    const btcMarkets = (data.data || []).filter(
-      (m: Market) =>
-        m.title?.includes("BTC/USD") &&
-        m.title?.includes("Up or Down") &&
-        m.status === "REGISTERED"
-    );
-    return btcMarkets[0] || null;
+    // Paginate through markets to find REGISTERED 15-min BTC market
+    for (let page = 0; page < 5; page++) {
+      const url = cursor
+        ? `${API_BASE}/markets?first=150&after=${cursor}`
+        : `${API_BASE}/markets?first=150`;
+
+      const res = await fetchWithProxy(url, { headers: getHeaders() });
+      const data = await res.json() as { success: boolean; data?: Market[]; cursor?: string | null; message?: string };
+
+      if (!data.success) {
+        console.log(`Markets API error: ${data.message}`);
+        return null;
+      }
+
+      const btcMarket = (data.data || []).find(
+        (m: Market) =>
+          m.title?.includes("BTC/USD") &&
+          m.title?.includes("Up or Down") &&
+          (m.title?.includes("PM ET") || m.title?.includes("AM ET")) &&
+          m.status === "REGISTERED"
+      );
+
+      if (btcMarket) return btcMarket;
+
+      cursor = data.cursor || null;
+      if (!cursor) break; // No more pages
+    }
+
+    return null;
   };
 
   const getMarketDetails = async (marketId: number): Promise<Market | null> => {
@@ -184,13 +202,13 @@ export async function createClient(): Promise<PredictClient> {
 
   const cancelOrder = async (orderId: string): Promise<boolean> => {
     try {
-      const res = await fetchWithProxy(`${API_BASE}/orders`, {
-        method: "DELETE",
+      const res = await fetchWithProxy(`${API_BASE}/orders/remove`, {
+        method: "POST",
         headers: getHeaders(),
-        body: JSON.stringify({ data: { orderIds: [orderId] } }),
+        body: JSON.stringify({ data: { ids: [orderId] } }),
       });
-      const result = await res.json() as { success: boolean };
-      return result.success;
+      const result = await res.json() as { success: boolean; removed?: string[] };
+      return result.success && (result.removed?.length ?? 0) > 0;
     } catch {
       return false;
     }

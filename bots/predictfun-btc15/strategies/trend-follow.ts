@@ -20,10 +20,17 @@ let currentOrderId: string | null = null;
 let currentSide: "UP" | "DOWN" | null = null;
 let startingPrice: number | null = null;
 
+let lastNoMarketLog = 0;
+let isTickRunning = false;
+
 async function refreshMarket() {
   const market = await client.getActiveMarket();
   if (!market) {
-    console.log("No active market");
+    const now = Date.now();
+    if (now - lastNoMarketLog > 10000) {
+      console.log("No market data");
+      lastNoMarketLog = now;
+    }
     return false;
   }
 
@@ -46,6 +53,9 @@ async function refreshMarket() {
 }
 
 async function tick() {
+  if (isTickRunning) return; // Prevent concurrent execution
+  isTickRunning = true;
+
   try {
     // Refresh market if needed
     if (!await refreshMarket()) return;
@@ -61,10 +71,11 @@ async function tick() {
     const priceStr = btcPrice.toLocaleString(undefined, { maximumFractionDigits: 2 });
     const arrow = diff > 0 ? "↑" : "↓";
 
-    // If side changed, cancel old order
+    // If side changed, cancel old order first
     if (currentSide && currentSide !== targetSide && currentOrderId) {
-      console.log(`[${timestamp}] Side changed ${currentSide} → ${targetSide}, canceling order`);
-      await client.cancelOrder(currentOrderId);
+      console.log(`[${timestamp}] Side changed ${currentSide} → ${targetSide}, canceling...`);
+      const canceled = await client.cancelOrder(currentOrderId);
+      console.log(`[${timestamp}] ${canceled ? "✅ Canceled" : "⚠️ Cancel failed"} ${currentOrderId.slice(0, 8)}...`);
       currentOrderId = null;
       currentSide = null;
     }
@@ -91,6 +102,8 @@ async function tick() {
     }
   } catch (error) {
     console.error(`Error:`, error);
+  } finally {
+    isTickRunning = false;
   }
 }
 
