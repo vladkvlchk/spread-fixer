@@ -1,19 +1,28 @@
 #!/usr/bin/env npx tsx
 
 /**
- * Polymarket User Activity Tracker
+ * Polymarket User Activity Tracker + Auto-Copy
  *
- * Monitors a user's activity on Polymarket in real-time by polling the Data API.
- * Shows available liquidity at same or better prices for copy-trading.
+ * Usage:
+ *   Watch only:  npx tsx scripts/follow-user.ts <address> [interval-ms]
+ *   Auto-copy:   npx tsx scripts/follow-user.ts <address> [interval-ms] --copy [percent]
  *
- * Usage: npx tsx scripts/follow-user.ts <wallet-address> [poll-interval-ms]
- *
- * Example: npx tsx scripts/follow-user.ts 0x1234...abcd 5000
+ * Examples:
+ *   npx tsx scripts/follow-user.ts 0x818f214c7f3e479cce1d964d53fe3db7297558cb 1500
+ *   npx tsx scripts/follow-user.ts 0x818f214c7f3e479cce1d964d53fe3db7297558cb 1500 --copy 10
  */
+
+// Load .env.local
+import { config } from "dotenv";
+config({ path: ".env.local" });
+
+import { executeCopyTrade, checkAndAlertRedeemable } from "../lib/polymarket-trading";
 
 const DATA_API_BASE = "https://data-api.polymarket.com";
 const CLOB_API_BASE = "https://clob.polymarket.com";
-const DEFAULT_POLL_INTERVAL = 5000; // 5 seconds
+const DEFAULT_POLL_INTERVAL = 2000;
+const DEFAULT_COPY_PERCENT = 10;
+const REDEEM_CHECK_INTERVAL = 60000; // Check for redeemable every 60 seconds
 
 interface Activity {
   proxyWallet: string;
@@ -30,182 +39,238 @@ interface Activity {
   title: string;
   slug: string;
   outcome?: string;
-  profileImage?: string;
-}
-
-interface OrderBookEntry {
-  price: string;
-  size: string;
-}
-
-interface OrderBook {
-  bids: OrderBookEntry[];
-  asks: OrderBookEntry[];
 }
 
 const seenTransactions = new Set<string>();
+let autoCopyEnabled = false;
+let copyPercent = DEFAULT_COPY_PERCENT;
 
-function formatTimestamp(ts: number): string {
-  return new Date(ts * 1000).toLocaleString();
+const c = {
+  reset: "\x1b[0m",
+  green: "\x1b[32m",
+  red: "\x1b[31m",
+  yellow: "\x1b[33m",
+  cyan: "\x1b[36m",
+  dim: "\x1b[2m",
+};
+
+function formatTime(ts: number): string {
+  return new Date(ts * 1000).toLocaleTimeString();
 }
 
-async function fetchOrderBook(tokenId: string): Promise<OrderBook | null> {
+async function fetchActivity(user: string): Promise<Activity[]> {
+  const res = await fetch(
+    `${DATA_API_BASE}/activity?user=${user}&limit=50&sortBy=TIMESTAMP&sortDirection=DESC`
+  );
+  if (!res.ok) return [];
+  return res.json();
+}
+
+async function fetchOrderBook(tokenId: string) {
   try {
-    const response = await fetch(`${CLOB_API_BASE}/book?token_id=${tokenId}`);
-    if (!response.ok) return null;
-    return response.json();
+    const res = await fetch(`${CLOB_API_BASE}/book?token_id=${tokenId}`);
+    if (!res.ok) return null;
+    return res.json();
   } catch {
     return null;
   }
 }
 
-function calculateAvailableLiquidity(
-  orderBook: OrderBook,
-  side: "BUY" | "SELL",
-  price: number
-): { shares: number; avgPrice: number; cost: number } {
-  // For BUY: look at asks at same or better (lower) price
-  // For SELL: look at bids at same or better (higher) price
-  const orders = side === "BUY" ? orderBook.asks : orderBook.bids;
-
-  let totalShares = 0;
-  let totalCost = 0;
-
-  for (const order of orders) {
-    const orderPrice = parseFloat(order.price);
-    const orderSize = parseFloat(order.size);
-
-    if (side === "BUY" && orderPrice <= price) {
-      totalShares += orderSize;
-      totalCost += orderSize * orderPrice;
-    } else if (side === "SELL" && orderPrice >= price) {
-      totalShares += orderSize;
-      totalCost += orderSize * orderPrice;
+function calcLiquidity(ob: { asks: { price: string; size: string }[]; bids: { price: string; size: string }[] }, side: "BUY" | "SELL", price: number) {
+  const orders = side === "BUY" ? ob.asks : ob.bids;
+  let shares = 0, cost = 0;
+  for (const o of orders) {
+    const p = parseFloat(o.price), s = parseFloat(o.size);
+    if ((side === "BUY" && p <= price) || (side === "SELL" && p >= price)) {
+      shares += s;
+      cost += s * p;
     }
   }
-
-  return {
-    shares: totalShares,
-    avgPrice: totalShares > 0 ? totalCost / totalShares : 0,
-    cost: totalCost,
-  };
+  return { shares, avgPrice: shares > 0 ? cost / shares : 0, cost };
 }
 
-async function formatActivity(activity: Activity): Promise<string> {
-  const lines: string[] = [];
-  const separator = "─".repeat(60);
+async function processActivity(a: Activity): Promise<void> {
+  const line = "─".repeat(60);
+  console.log(line);
+  console.log(`[${formatTime(a.timestamp)}] ${a.type}`);
+  console.log(`  Market: ${a.title}`);
+  if (a.outcome) console.log(`  Outcome: ${a.outcome}`);
 
-  lines.push(separator);
-  lines.push(`[${formatTimestamp(activity.timestamp)}] ${activity.type}`);
-  lines.push(`  Market: ${activity.title}`);
-  if (activity.outcome) {
-    lines.push(`  Outcome: ${activity.outcome}`);
-  }
+  if (a.type === "TRADE" && a.side) {
+    const sideColor = a.side === "BUY" ? c.green : c.red;
+    console.log(`  ${sideColor}${a.side}${c.reset} ${a.size.toFixed(2)} @ $${a.price.toFixed(4)} = $${a.usdcSize.toFixed(2)}`);
 
-  if (activity.type === "TRADE" && activity.side) {
-    const color = activity.side === "BUY" ? "\x1b[32m" : "\x1b[31m"; // green/red
-    const reset = "\x1b[0m";
-    lines.push(`  ${color}${activity.side}${reset} ${activity.size.toFixed(2)} shares @ $${activity.price.toFixed(4)}`);
-    lines.push(`  Total: $${activity.usdcSize.toFixed(2)}`);
-
-    // Fetch order book and show available liquidity
-    if (activity.asset) {
-      const orderBook = await fetchOrderBook(activity.asset);
-      if (orderBook) {
-        const liquidity = calculateAvailableLiquidity(orderBook, activity.side, activity.price);
-        const cyan = "\x1b[36m";
-        const yellow = "\x1b[33m";
-
-        if (liquidity.shares > 0) {
-          lines.push(`  ${cyan}📊 Copy opportunity:${reset}`);
-          lines.push(`     ${yellow}${liquidity.shares.toFixed(2)}${reset} shares available @ ≤$${activity.price.toFixed(2)}`);
-          lines.push(`     Avg price: $${liquidity.avgPrice.toFixed(4)} | Total cost: $${liquidity.cost.toFixed(2)}`);
-        } else {
-          lines.push(`  ${cyan}📊 No liquidity at this price${reset}`);
+    // Show liquidity
+    if (a.asset) {
+      const ob = await fetchOrderBook(a.asset);
+      if (ob) {
+        const liq = calcLiquidity(ob, a.side, a.price);
+        if (liq.shares > 0) {
+          console.log(`  ${c.cyan}📊 ${c.yellow}${liq.shares.toFixed(2)}${c.reset} shares @ ≤$${a.price.toFixed(2)} ${c.dim}(~$${liq.cost.toFixed(2)})${c.reset}`);
         }
       }
     }
+
+    // Note: Auto-copy is handled via aggregation in poll() to combine small trades
   } else {
-    lines.push(`  Size: ${activity.size.toFixed(2)} | Value: $${activity.usdcSize.toFixed(2)}`);
+    console.log(`  Size: ${a.size.toFixed(2)} | Value: $${a.usdcSize.toFixed(2)}`);
   }
-
-  lines.push(`  Tx: ${activity.transactionHash}`);
-  lines.push(`  URL: https://polymarket.com/event/${activity.slug}`);
-
-  return lines.join("\n");
 }
 
-async function fetchUserActivity(userAddress: string, limit = 50): Promise<Activity[]> {
-  const url = new URL(`${DATA_API_BASE}/activity`);
-  url.searchParams.set("user", userAddress);
-  url.searchParams.set("limit", limit.toString());
-  url.searchParams.set("sortBy", "TIMESTAMP");
-  url.searchParams.set("sortDirection", "DESC");
-
-  const response = await fetch(url.toString());
-
-  if (!response.ok) {
-    throw new Error(`API error: ${response.status} ${response.statusText}`);
-  }
-
-  return response.json();
-}
-
-async function pollForNewActivity(userAddress: string): Promise<void> {
+async function poll(user: string): Promise<void> {
   try {
-    const activities = await fetchUserActivity(userAddress);
+    const activities = await fetchActivity(user);
+    const newOnes = activities.filter((a) => !seenTransactions.has(a.transactionHash)).reverse();
 
-    // Process in reverse order (oldest first) so new activities appear at the bottom
-    const newActivities = activities
-      .filter((a) => !seenTransactions.has(a.transactionHash))
-      .reverse();
-
-    for (const activity of newActivities) {
-      seenTransactions.add(activity.transactionHash);
-      console.log(await formatActivity(activity));
+    // Mark all as seen first
+    for (const a of newOnes) {
+      seenTransactions.add(a.transactionHash);
     }
 
-    if (newActivities.length > 0) {
-      console.log(`\n[${new Date().toLocaleTimeString()}] Found ${newActivities.length} new action(s)\n`);
+    // Show individual trades
+    for (const a of newOnes) {
+      await processActivity(a);
     }
-  } catch (error) {
-    console.error(`[${new Date().toLocaleTimeString()}] Error fetching activity:`, error);
+
+    // Aggregate trades by asset+side for copy trading
+    if (autoCopyEnabled && newOnes.length > 0) {
+      const trades = newOnes.filter((a) => a.type === "TRADE" && a.side && a.asset);
+
+      // Group by asset+side
+      const grouped = new Map<string, { asset: string; side: "BUY" | "SELL"; totalSize: number; totalValue: number; title: string }>();
+
+      for (const t of trades) {
+        const key = `${t.asset}-${t.side}`;
+        const existing = grouped.get(key);
+        if (existing) {
+          existing.totalSize += t.size;
+          existing.totalValue += t.usdcSize;
+        } else {
+          grouped.set(key, {
+            asset: t.asset,
+            side: t.side!,
+            totalSize: t.size,
+            totalValue: t.usdcSize,
+            title: t.title,
+          });
+        }
+      }
+
+      // Execute aggregated copy trades
+      for (const [, group] of grouped) {
+        const avgPrice = group.totalValue / group.totalSize;
+        const scaledValue = group.totalValue * (copyPercent / 100);
+
+        if (scaledValue < 1) {
+          console.log(`  ${c.yellow}⏭️ Aggregated still too small: $${scaledValue.toFixed(2)} < $1${c.reset}`);
+          continue;
+        }
+
+        console.log(`  ${c.cyan}📦 Aggregated: ${group.totalSize.toFixed(2)} shares @ avg $${avgPrice.toFixed(4)} = $${group.totalValue.toFixed(2)}${c.reset}`);
+        process.stdout.write(`  ${c.yellow}⏳ Copying ${copyPercent}%...${c.reset}`);
+
+        const result = await executeCopyTrade({
+          tokenId: group.asset,
+          side: group.side,
+          originalSize: group.totalSize,
+          originalPrice: avgPrice,
+          copyPercent,
+        });
+
+        process.stdout.write("\r" + " ".repeat(50) + "\r");
+
+        if (result.success) {
+          console.log(`  ${c.green}✅ Copied! ${result.size} shares @ $${result.price?.toFixed(4)}${c.reset}`);
+        } else {
+          const isSkip = result.error?.includes("min") || result.error?.includes("small");
+          console.log(`  ${isSkip ? c.yellow + "⏭️ Skipped" : c.red + "❌ Failed"}: ${result.error}${c.reset}`);
+        }
+      }
+    }
+
+    // Heartbeat
+    if (newOnes.length === 0) {
+      process.stdout.write(`\r${c.dim}[${new Date().toLocaleTimeString()}] polling...${c.reset}`);
+    } else {
+      console.log();
+    }
+  } catch (e) {
+    console.error(`\n${c.red}Error: ${e}${c.reset}`);
   }
 }
 
 async function main(): Promise<void> {
-  const [, , userAddress, pollIntervalArg] = process.argv;
+  const args = process.argv.slice(2);
+
+  // Parse arguments
+  const copyIndex = args.indexOf("--copy");
+  if (copyIndex !== -1) {
+    autoCopyEnabled = true;
+    const percentArg = args[copyIndex + 1];
+    if (percentArg && !percentArg.startsWith("-") && !percentArg.startsWith("0x")) {
+      copyPercent = parseInt(percentArg, 10);
+      args.splice(copyIndex, 2);
+    } else {
+      args.splice(copyIndex, 1);
+    }
+  }
+
+  const [userAddress, pollIntervalArg] = args;
 
   if (!userAddress) {
-    console.error("Usage: npx tsx scripts/follow-user.ts <wallet-address> [poll-interval-ms]");
-    console.error("\nExample: npx tsx scripts/follow-user.ts 0x1234...abcd 5000");
+    console.log("Usage:");
+    console.log("  npx tsx scripts/follow-user.ts <address> [interval-ms]");
+    console.log("  npx tsx scripts/follow-user.ts <address> [interval-ms] --copy [percent]");
+    console.log("\nExamples:");
+    console.log("  npx tsx scripts/follow-user.ts 0x818...cb 1500");
+    console.log("  npx tsx scripts/follow-user.ts 0x818...cb 1500 --copy 10");
     process.exit(1);
   }
 
-  // Validate wallet address format
   if (!/^0x[a-fA-F0-9]{40}$/.test(userAddress)) {
-    console.error("Error: Invalid wallet address format. Must be 0x followed by 40 hex characters.");
+    console.error("Error: Invalid wallet address");
     process.exit(1);
   }
 
   const pollInterval = pollIntervalArg ? parseInt(pollIntervalArg, 10) : DEFAULT_POLL_INTERVAL;
 
   console.log("═".repeat(60));
-  console.log("  Polymarket User Activity Tracker");
+  console.log("  Polymarket Copy Trader");
   console.log("═".repeat(60));
-  console.log(`  Tracking: ${userAddress}`);
-  console.log(`  Poll interval: ${pollInterval}ms`);
-  console.log(`  Started: ${new Date().toLocaleString()}`);
+  console.log(`  Following: ${userAddress.slice(0, 10)}...${userAddress.slice(-8)}`);
+  console.log(`  Interval:  ${pollInterval}ms`);
+  if (autoCopyEnabled) {
+    console.log(`  ${c.green}Auto-copy:  ON (${copyPercent}%)${c.reset}`);
+  } else {
+    console.log(`  Auto-copy: OFF (watch only)`);
+  }
   console.log("═".repeat(60));
-  console.log("\nWaiting for activity...\n");
 
-  // Initial fetch to populate seen transactions
-  const initialActivities = await fetchUserActivity(userAddress);
-  initialActivities.forEach((a) => seenTransactions.add(a.transactionHash));
-  console.log(`Loaded ${initialActivities.length} historical activities. Now watching for new ones...\n`);
+  // Load initial
+  const initial = await fetchActivity(userAddress);
+  initial.forEach((a) => seenTransactions.add(a.transactionHash));
+  console.log(`Loaded ${initial.length} historical. Watching...\n`);
 
-  // Start polling
-  setInterval(() => pollForNewActivity(userAddress), pollInterval);
+  // Poll loop
+  setInterval(() => poll(userAddress), pollInterval);
+
+  // Redeemable check loop (every 60s)
+  const checkRedeemable = async () => {
+    const result = await checkAndAlertRedeemable();
+    if (result.hasRedeemable) {
+      console.log(`\n${"!".repeat(60)}`);
+      console.log(`${c.yellow}💰 REDEEMABLE POSITIONS: $${result.totalValue.toFixed(2)}${c.reset}`);
+      for (const pos of result.positions) {
+        console.log(`   ${pos.title} (${pos.outcome}): ${pos.size.toFixed(2)} shares = $${pos.currentValue.toFixed(2)}`);
+        console.log(`   ${c.dim}→ https://polymarket.com/event/${pos.slug}${c.reset}`);
+      }
+      console.log(`${"!".repeat(60)}\n`);
+    }
+  };
+
+  // Initial check
+  await checkRedeemable();
+  setInterval(checkRedeemable, REDEEM_CHECK_INTERVAL);
 }
 
 main().catch(console.error);

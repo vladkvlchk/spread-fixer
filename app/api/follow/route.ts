@@ -67,10 +67,12 @@ export async function GET(req: NextRequest) {
   const seen = new Set<string>();
   let stopped = false;
 
+  const encoder = new TextEncoder();
+
   const stream = new ReadableStream({
     async start(controller) {
       const send = (data: object) => {
-        controller.enqueue(`data: ${JSON.stringify(data)}\n\n`);
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       };
 
       // Initial load
@@ -84,6 +86,7 @@ export async function GET(req: NextRequest) {
           const activities = await fetchActivity(user);
           const newOnes = activities.filter((a) => !seen.has(a.transactionHash)).reverse();
 
+          // First, send all trade info to UI
           for (const a of newOnes) {
             seen.add(a.transactionHash);
 
@@ -93,7 +96,6 @@ export async function GET(req: NextRequest) {
               if (ob) liquidity = calcLiquidity(ob, a.side, a.price);
             }
 
-            // Send trade info first
             send({
               type: "trade",
               data: {
@@ -111,38 +113,94 @@ export async function GET(req: NextRequest) {
                 liquidity,
               },
             });
+          }
 
-            // Auto-copy if enabled
-            if (autoCopy && a.type === "TRADE" && a.side && a.asset) {
-              send({ type: "copy", tx: a.transactionHash, status: "pending" });
+          // Auto-copy with aggregation
+          if (autoCopy && newOnes.length > 0) {
+            const trades = newOnes.filter((a) => a.type === "TRADE" && a.side && a.asset);
 
-              const result = await executeCopyTrade({
-                tokenId: a.asset,
-                side: a.side,
-                originalSize: a.size,
-                originalPrice: a.price,
-                copyPercent,
-              });
+            // Group by asset+side
+            const grouped = new Map<string, {
+              asset: string;
+              side: "BUY" | "SELL";
+              totalSize: number;
+              totalValue: number;
+              txs: string[];
+            }>();
 
-              if (result.success) {
-                send({
-                  type: "copy",
-                  tx: a.transactionHash,
-                  status: "success",
-                  orderId: result.orderId,
-                  size: result.size,
-                  price: result.price,
-                });
+            for (const t of trades) {
+              const key = `${t.asset}-${t.side}`;
+              const existing = grouped.get(key);
+              if (existing) {
+                existing.totalSize += t.size;
+                existing.totalValue += t.usdcSize;
+                existing.txs.push(t.transactionHash);
               } else {
-                send({
-                  type: "copy",
-                  tx: a.transactionHash,
-                  status: result.error?.includes("too small") ? "skipped" : "failed",
-                  error: result.error,
+                grouped.set(key, {
+                  asset: t.asset,
+                  side: t.side!,
+                  totalSize: t.size,
+                  totalValue: t.usdcSize,
+                  txs: [t.transactionHash],
                 });
               }
             }
+
+            // Execute aggregated copy trades
+            for (const [, group] of grouped) {
+              const avgPrice = group.totalValue / group.totalSize;
+              const scaledValue = group.totalValue * (copyPercent / 100);
+
+              // Mark all related trades as pending
+              for (const tx of group.txs) {
+                send({ type: "copy", tx, status: "pending" });
+              }
+
+              if (scaledValue < 1) {
+                // Too small even aggregated
+                for (const tx of group.txs) {
+                  send({
+                    type: "copy",
+                    tx,
+                    status: "skipped",
+                    error: `Aggregated $${scaledValue.toFixed(2)} < $1 min`,
+                  });
+                }
+                continue;
+              }
+
+              const result = await executeCopyTrade({
+                tokenId: group.asset,
+                side: group.side,
+                originalSize: group.totalSize,
+                originalPrice: avgPrice,
+                copyPercent,
+              });
+
+              // Update all related trades with the result
+              for (const tx of group.txs) {
+                if (result.success) {
+                  send({
+                    type: "copy",
+                    tx,
+                    status: "success",
+                    orderId: result.orderId,
+                    size: result.size,
+                    price: result.price,
+                  });
+                } else {
+                  send({
+                    type: "copy",
+                    tx,
+                    status: result.error?.includes("too small") ? "skipped" : "failed",
+                    error: result.error,
+                  });
+                }
+              }
+            }
           }
+          // Heartbeat - confirm we're still polling
+          send({ type: "heartbeat", time: Date.now() });
         } catch (e) {
           send({ type: "error", message: String(e) });
         }

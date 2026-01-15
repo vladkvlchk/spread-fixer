@@ -3,6 +3,32 @@
 import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
 
+// Quick select presets
+const PRESETS = [
+  {
+    address: "0x818f214c7f3e479cce1d964d53fe3db7297558cb",
+    name: "BTC 15min",
+    comment: "деп ~$200k",
+  },
+  {
+    address: "0x8278252ebbf354eca8ce316e680a0eaf02859464",
+    name: "London C",
+    comment: "деп ~$200k",
+  },
+  {
+    address: "0x57ee70867b4e387de9de34fd62bc685aa02a8112",
+    name: "Weather",
+    comment: "купує надзвичайно дешеві shares, навряд ми зможем повторяти",
+  },
+  {
+    address: "0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d",
+    name: "@gabagool22 (BTC, ETH)",
+    comment: "",
+  },
+  // Add more presets here:
+  // { address: "0x...", name: "...", comment: "..." },
+];
+
 type Trade = {
   timestamp: number;
   activityType: string;
@@ -24,16 +50,54 @@ type Trade = {
   copyError?: string;
 };
 
+type BalanceData = {
+  totalValue: number;
+  totalPnl: number;
+  totalPnlPercent: number;
+  positionCount: number;
+  positions: {
+    title: string;
+    outcome: string;
+    size: number;
+    currentValue: number;
+    cashPnl: number;
+    percentPnl: number;
+  }[];
+};
+
 export default function FollowPage() {
   const [address, setAddress] = useState("");
-  const [interval, setInterval] = useState(2000);
+  const [interval, setInterval] = useState(1500);
   const [isRunning, setIsRunning] = useState(false);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [status, setStatus] = useState("");
   const [autoCopy, setAutoCopy] = useState(false);
   const [copyPercent, setCopyPercent] = useState(10);
+  const [lastHeartbeat, setLastHeartbeat] = useState<number | null>(null);
+  const [balanceData, setBalanceData] = useState<BalanceData | null>(null);
+  const [balanceLoading, setBalanceLoading] = useState(false);
+  const [showBalance, setShowBalance] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const checkBalance = async () => {
+    if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+      return;
+    }
+    setBalanceLoading(true);
+    try {
+      const res = await fetch(`/api/follow/balance?user=${address}`);
+      if (res.ok) {
+        const data = await res.json();
+        setBalanceData(data);
+        setShowBalance(true);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setBalanceLoading(false);
+    }
+  };
 
   const start = () => {
     if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
@@ -67,13 +131,17 @@ export default function FollowPage() {
             t.tx === msg.tx ? { ...t, copyStatus: msg.status, copyError: msg.error } : t
           )
         );
+      } else if (msg.type === "heartbeat") {
+        setLastHeartbeat(msg.time);
       } else if (msg.type === "error") {
         setStatus(`Error: ${msg.message}`);
+        setLastHeartbeat(null);
       }
     };
 
     es.onerror = () => {
       setStatus("Connection lost. Reconnecting...");
+      setLastHeartbeat(null);
     };
   };
 
@@ -82,6 +150,7 @@ export default function FollowPage() {
     eventSourceRef.current = null;
     setIsRunning(false);
     setStatus("Stopped");
+    setLastHeartbeat(null);
   };
 
   useEffect(() => {
@@ -111,15 +180,47 @@ export default function FollowPage() {
 
         <div className="bg-white dark:bg-neutral-900 rounded-lg p-4 mb-4 shadow-sm">
           <div className="flex flex-col gap-3">
+            {/* Quick select */}
+            <div className="flex flex-wrap gap-2">
+              {PRESETS.map((p) => (
+                <button
+                  key={p.address}
+                  onClick={() => {
+                    setAddress(p.address);
+                    setShowBalance(false);
+                  }}
+                  disabled={isRunning}
+                  className={`px-3 py-1.5 text-sm rounded-md border transition-colors ${
+                    address === p.address
+                      ? "bg-blue-600 border-blue-600 text-white"
+                      : "border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                  } disabled:opacity-50`}
+                  title={p.comment}
+                >
+                  {p.name}
+                </button>
+              ))}
+            </div>
+
             <div className="flex flex-col sm:flex-row gap-3">
               <input
                 type="text"
                 placeholder="0x... wallet address"
                 value={address}
-                onChange={(e) => setAddress(e.target.value)}
+                onChange={(e) => {
+                  setAddress(e.target.value);
+                  setShowBalance(false);
+                }}
                 disabled={isRunning}
                 className="flex-1 px-3 py-2 rounded-md border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-800 text-neutral-900 dark:text-white font-mono text-sm"
               />
+              <button
+                onClick={checkBalance}
+                disabled={!address || balanceLoading}
+                className="px-3 py-2 text-sm bg-neutral-200 dark:bg-neutral-700 hover:bg-neutral-300 dark:hover:bg-neutral-600 text-neutral-700 dark:text-neutral-200 rounded-md disabled:opacity-50"
+              >
+                {balanceLoading ? "..." : "Balance"}
+              </button>
               <div className="flex items-center gap-2">
                 <input
                   type="number"
@@ -134,6 +235,45 @@ export default function FollowPage() {
                 <span className="text-sm text-neutral-500">ms</span>
               </div>
             </div>
+
+            {/* Balance display */}
+            {showBalance && balanceData && (
+              <div className="p-3 bg-neutral-100 dark:bg-neutral-800 rounded-md">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-4">
+                    <span className="text-lg font-bold text-neutral-900 dark:text-white">
+                      ${balanceData.totalValue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                    </span>
+                    <span className={`text-sm font-medium ${balanceData.totalPnl >= 0 ? "text-green-500" : "text-red-500"}`}>
+                      {balanceData.totalPnl >= 0 ? "+" : ""}${balanceData.totalPnl.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                      {" "}({balanceData.totalPnlPercent >= 0 ? "+" : ""}{balanceData.totalPnlPercent.toFixed(1)}%)
+                    </span>
+                    <span className="text-xs text-neutral-500">
+                      {balanceData.positionCount} positions
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setShowBalance(false)}
+                    className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="space-y-1 max-h-40 overflow-y-auto text-xs">
+                  {balanceData.positions.slice(0, 10).map((p, i) => (
+                    <div key={i} className="flex items-center justify-between text-neutral-600 dark:text-neutral-400">
+                      <span className="truncate flex-1 mr-2">{p.title} ({p.outcome})</span>
+                      <span className="whitespace-nowrap">
+                        ${p.currentValue.toFixed(0)}
+                        <span className={`ml-2 ${p.cashPnl >= 0 ? "text-green-500" : "text-red-500"}`}>
+                          {p.cashPnl >= 0 ? "+" : ""}{p.cashPnl.toFixed(0)}
+                        </span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="flex flex-col sm:flex-row sm:items-center gap-3 pt-2 border-t border-neutral-200 dark:border-neutral-800">
               <label className="flex items-center gap-2 cursor-pointer">
@@ -187,9 +327,17 @@ export default function FollowPage() {
               </div>
             </div>
           </div>
-          {status && (
-            <p className="mt-2 text-sm text-neutral-500">{status}</p>
-          )}
+          <div className="mt-2 flex items-center gap-2">
+            {isRunning && (
+              <span className={`flex items-center gap-1.5 text-sm ${lastHeartbeat ? "text-green-500" : "text-yellow-500"}`}>
+                <span className={`w-2 h-2 rounded-full ${lastHeartbeat ? "bg-green-500 animate-pulse" : "bg-yellow-500"}`} />
+                {lastHeartbeat ? "LIVE" : "Connecting..."}
+              </span>
+            )}
+            {status && (
+              <span className="text-sm text-neutral-500">{status}</span>
+            )}
+          </div>
         </div>
 
         <div
