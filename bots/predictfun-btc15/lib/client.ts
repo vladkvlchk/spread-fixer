@@ -104,37 +104,62 @@ export async function createClient(): Promise<PredictClient> {
         ? `${API_BASE}/markets?first=150&after=${cursor}`
         : `${API_BASE}/markets?first=150`;
 
-      const res = await fetchWithProxy(url, { headers: getHeaders() });
-      const data = await res.json() as { success: boolean; data?: Market[]; cursor?: string | null; message?: string };
+      try {
+        const res = await fetchWithProxy(url, { headers: getHeaders() });
+        const text = await res.text();
 
-      if (!data.success) {
-        console.log(`Markets API error: ${data.message}`);
+        // Check if response is HTML (error page)
+        if (text.startsWith('<!DOCTYPE') || text.startsWith('<html')) {
+          console.log(`Markets API returned HTML (status ${res.status})`);
+          return null;
+        }
+
+        const data = JSON.parse(text) as { success: boolean; data?: Market[]; cursor?: string | null; message?: string };
+
+        if (!data.success) {
+          console.log(`Markets API error: ${data.message}`);
+          return null;
+        }
+
+        const btcMarket = (data.data || []).find(
+          (m: Market) =>
+            m.title?.includes("BTC/USD") &&
+            m.title?.includes("Up or Down") &&
+            (m.title?.includes("PM ET") || m.title?.includes("AM ET")) &&
+            m.status === "REGISTERED"
+        );
+
+        if (btcMarket) return btcMarket;
+
+        cursor = data.cursor || null;
+        if (!cursor) break; // No more pages
+      } catch (error) {
+        console.log(`Markets API request failed: ${error}`);
         return null;
       }
-
-      const btcMarket = (data.data || []).find(
-        (m: Market) =>
-          m.title?.includes("BTC/USD") &&
-          m.title?.includes("Up or Down") &&
-          (m.title?.includes("PM ET") || m.title?.includes("AM ET")) &&
-          m.status === "REGISTERED"
-      );
-
-      if (btcMarket) return btcMarket;
-
-      cursor = data.cursor || null;
-      if (!cursor) break; // No more pages
     }
 
     return null;
   };
 
   const getMarketDetails = async (marketId: number): Promise<Market | null> => {
-    const res = await fetchWithProxy(`${API_BASE}/markets/${marketId}`, {
-      headers: getHeaders(),
-    });
-    const data = await res.json() as { success: boolean; data?: Market };
-    return data.success ? data.data! : null;
+    try {
+      const res = await fetchWithProxy(`${API_BASE}/markets/${marketId}`, {
+        headers: getHeaders(),
+      });
+      const text = await res.text();
+
+      if (text.startsWith('<!DOCTYPE') || text.startsWith('<html')) {
+        console.log(`Market details API returned HTML (status ${res.status})`);
+        return null;
+      }
+
+      const data = JSON.parse(text) as { success: boolean; data?: Market };
+      return data.success ? data.data! : null;
+    } catch (error) {
+      console.log(`Market details API failed: ${error}`);
+      return null;
+    }
   };
 
   const placeLimitOrder = async (
