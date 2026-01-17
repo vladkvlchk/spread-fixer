@@ -59,6 +59,35 @@ let pfRequestId = 1;
 
 let pmWs: WebSocket | null = null;
 
+// Extract time window from market title for comparison
+// PM: "Bitcoin Up or Down - January 17, 9:15AM-9:30AM ET"
+// PF: "BTC/USD Up or Down - January 17, 9:15-9:30AM ET"
+function extractTimeWindow(title: string | null): string | null {
+  if (!title) return null;
+  // Match patterns like "9:15AM-9:30AM" or "9:15-9:30AM"
+  const match = title.match(/(\d{1,2}:\d{2}(?:AM|PM)?-\d{1,2}:\d{2}(?:AM|PM))/i);
+  return match ? match[1].toUpperCase() : null;
+}
+
+function areMarketsInSync(): boolean {
+  const pmWindow = extractTimeWindow(pmTitle);
+  const pfWindow = extractTimeWindow(pfTitle);
+
+  if (!pmWindow || !pfWindow) return false;
+
+  // Normalize: "9:15AM-9:30AM" and "9:15-9:30AM" should match
+  // Extract start and end times
+  const pmMatch = pmWindow.match(/(\d{1,2}:\d{2})(?:AM|PM)?-(\d{1,2}:\d{2})(AM|PM)/);
+  const pfMatch = pfWindow.match(/(\d{1,2}:\d{2})(?:AM|PM)?-(\d{1,2}:\d{2})(AM|PM)/);
+
+  if (!pmMatch || !pfMatch) return false;
+
+  // Compare start time, end time, and AM/PM
+  return pmMatch[1] === pfMatch[1] &&
+         pmMatch[2] === pfMatch[2] &&
+         pmMatch[3] === pfMatch[3];
+}
+
 // Calculate expected market title based on current ET time
 function getExpectedMarketTitle(): string {
   const now = new Date();
@@ -358,6 +387,22 @@ function displayArbitrage() {
   console.log(`═══════════════════════════════════════════════════════════`);
   console.log(`  Arbitrage Monitor: predict.fun vs Polymarket   ${timestamp}`);
   console.log(`═══════════════════════════════════════════════════════════`);
+  const inSync = areMarketsInSync();
+  const syncStatus = inSync ? '\x1B[32m✓ IN SYNC\x1B[0m' : '\x1B[31m✗ OUT OF SYNC\x1B[0m';
+
+  console.log(`PM: ${pmTitle || "searching..."}`);
+  console.log(`PF: ${pfTitle || "searching..."}`);
+  console.log(`Status: ${syncStatus}`);
+  console.log(`───────────────────────────────────────────────────────────`);
+
+  // If markets are out of sync, show warning and don't process arbitrage
+  if (!inSync) {
+    console.log(`\n\x1B[43m\x1B[30m  WAITING FOR MARKETS TO SYNC  \x1B[0m`);
+    console.log(`\nMarkets are on different 15-min windows.`);
+    console.log(`Waiting for both platforms to switch to the same market...`);
+    return;
+  }
+
   console.log(`                      UP              DOWN`);
   console.log(`───────────────────────────────────────────────────────────`);
   console.log(`Polymarket       ${fmt(pmUpBid)}/${fmt(pmUpAsk)}    ${fmt(pmDownBid)}/${fmt(pmDownAsk)}`);
@@ -414,24 +459,33 @@ async function main() {
     connectPredictFunWS();
   }
 
-  // Refresh markets every 30 seconds
+  // Refresh markets every 15 seconds to catch new 15-min windows
   setInterval(async () => {
-    // Check for new markets
-    if (!upTokenId) {
-      const found = await findPolymarketMarket();
-      if (found) connectPolymarketWS();
+    // Always check for new Polymarket market
+    const oldUpTokenId = upTokenId;
+    const found = await findPolymarketMarket();
+    if (found && upTokenId !== oldUpTokenId) {
+      // New market found, reconnect WebSocket
+      if (pmWs) {
+        pmWs.close();
+      }
+      connectPolymarketWS();
     }
 
-    if (pfClient && !pfMarketId) {
+    // Always check for new predict.fun market
+    if (pfClient) {
       const market = await pfClient.getActiveMarket();
-      if (market) {
+      if (market && market.id !== pfMarketId) {
+        // New market found, reconnect WebSocket
         pfMarketId = market.id;
         pfTitle = market.title;
-        console.log(`Found predict.fun: ${pfTitle}`);
+        if (pfWs) {
+          pfWs.close();
+        }
         connectPredictFunWS();
       }
     }
-  }, 30000);
+  }, 15000);
 }
 
 main().catch(console.error);

@@ -1,12 +1,13 @@
 /**
- * Cross-Platform Spread Bot
+ * Cross-Platform Spread Bot (Infinity)
  *
  * Buys YES on one platform + NO on the other when total cost < $1
  * Guaranteed profit: one side always wins and pays $1
+ * Sends Telegram alert when balance drops below $20
  *
  * Example: PM UP @ 50¢ + PF DOWN @ 45¢ = 95¢ → 5¢ profit guaranteed
  *
- * npx tsx bots/predictfun-btc15/strategies/cross-spread.ts
+ * npx tsx bots/predictfun-btc15/strategies/cross-spread-infinity.ts
  */
 
 import "dotenv/config";
@@ -18,7 +19,57 @@ import path from "path";
 import WebSocket from "ws";
 
 // Log file
-const LOG_FILE = path.join(__dirname, "cross-spread.log");
+const LOG_FILE = path.join(__dirname, "cross-spread-infinity.log");
+
+// Telegram config
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const LOW_BALANCE_THRESHOLD = 20; // Alert when balance drops below $20
+const lowBalanceAlertSent = { pm: false, pf: false }; // Don't spam alerts
+
+async function sendTelegram(message: string): Promise<boolean> {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("  [Telegram not configured]");
+    return false;
+  }
+
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: "HTML",
+      }),
+    });
+
+    const data = await res.json() as { ok: boolean };
+    return data.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function checkLowBalance() {
+  const pmRemaining = PM_BALANCE - pmSpent;
+  const pfRemaining = PF_BALANCE - pfSpent;
+
+  if (pmRemaining < LOW_BALANCE_THRESHOLD && !lowBalanceAlertSent.pm) {
+    lowBalanceAlertSent.pm = true;
+    const msg = `⚠️ <b>Low Polymarket Balance!</b>\n\nRemaining: $${pmRemaining.toFixed(2)}\nThreshold: $${LOW_BALANCE_THRESHOLD}`;
+    await sendTelegram(msg);
+    log(`LOW BALANCE ALERT: PM $${pmRemaining.toFixed(2)}`);
+  }
+
+  if (pfRemaining < LOW_BALANCE_THRESHOLD && !lowBalanceAlertSent.pf) {
+    lowBalanceAlertSent.pf = true;
+    const msg = `⚠️ <b>Low predict.fun Balance!</b>\n\nRemaining: $${pfRemaining.toFixed(2)}\nThreshold: $${LOW_BALANCE_THRESHOLD}`;
+    await sendTelegram(msg);
+    log(`LOW BALANCE ALERT: PF $${pfRemaining.toFixed(2)}`);
+  }
+}
 
 function log(message: string) {
   const timestamp = new Date().toISOString();
@@ -45,12 +96,12 @@ const CHAIN_ID = 137;
 // IMPORTANT: Minimum order value is $1!
 const MIN_PROFIT_CENTS = 2; // Minimum profit in cents to execute (2¢ = 2%)
 const MIN_ORDER_VALUE = 1; // $1 minimum order value
-const MAX_TRADES = 10; // Max number of spread trades per session
+const MAX_TRADES = 15; // Max number of spread trades per session
 const COOLDOWN_MS = 5000; // Cooldown between trades
 
 // Available balance on each platform (update manually)
-const PM_BALANCE = 52; // Polymarket USDC balance
-const PF_BALANCE = 48; // predict.fun USDC balance
+const PM_BALANCE = 53; // Polymarket USDC balance
+const PF_BALANCE = 108; // predict.fun USDC balance
 
 // Track spent amounts
 let pmSpent = 0;
@@ -617,10 +668,12 @@ async function executeSpread(
     tradesExecuted++;
     console.log(`\n  SPREAD COMPLETE`);
     log(`SPREAD COMPLETE: ${type}, size=${size}, cost=$${totalCost.toFixed(2)}, profit=$${expectedProfit.toFixed(2)}`);
+    await checkLowBalance();
   } else if (order1Success || order2Success) {
     console.log(`\n  PARTIAL - Only one leg filled!`);
     log(`PARTIAL FILL: ${type}, order1=${order1Success}, order2=${order2Success}`);
     tradesExecuted++; // Still count it
+    await checkLowBalance();
   } else {
     console.log(`\n  BOTH ORDERS FAILED`);
     log(`BOTH FAILED: ${type}`);
@@ -687,6 +740,8 @@ async function main() {
       tradesExecuted = 0;
       pmSpent = 0;
       pfSpent = 0;
+      lowBalanceAlertSent.pm = false;
+      lowBalanceAlertSent.pf = false;
       log(`Reset counters for new 15-min window`);
     }
 
