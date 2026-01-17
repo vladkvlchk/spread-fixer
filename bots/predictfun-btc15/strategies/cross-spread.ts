@@ -13,7 +13,26 @@ import "dotenv/config";
 import { config } from "dotenv";
 config({ path: ".env.local" });
 
+import fs from "fs";
+import path from "path";
 import WebSocket from "ws";
+
+// Log file
+const LOG_FILE = path.join(__dirname, "cross-spread.log");
+
+function log(message: string) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${message}\n`;
+  fs.appendFileSync(LOG_FILE, line);
+}
+
+function logError(context: string, error: unknown) {
+  const timestamp = new Date().toISOString();
+  const errorStr = error instanceof Error ? error.message : JSON.stringify(error);
+  const line = `[${timestamp}] ERROR [${context}]: ${errorStr}\n`;
+  fs.appendFileSync(LOG_FILE, line);
+  console.log(`  [logged to cross-spread.log]`);
+}
 import { createClient, type Market, type PredictClient } from "../lib/client";
 import { ClobClient, Side, type TickSize } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
@@ -28,6 +47,14 @@ const MIN_PROFIT_CENTS = 2; // Minimum profit in cents to execute (2¢ = 2%)
 const MIN_ORDER_VALUE = 1; // $1 minimum order value
 const MAX_TRADES = 10; // Max number of spread trades per session
 const COOLDOWN_MS = 5000; // Cooldown between trades
+
+// Available balance on each platform (update manually)
+const PM_BALANCE = 28; // Polymarket USDC balance
+const PF_BALANCE = 60; // predict.fun USDC balance
+
+// Track spent amounts
+let pmSpent = 0;
+let pfSpent = 0;
 
 // Polymarket state
 let pmClient: ClobClient | null = null;
@@ -340,6 +367,7 @@ async function checkAndExecute() {
 
   console.log(`───────────────────────────────────────────────────────────`);
   console.log(`Trades: ${tradesExecuted}/${MAX_TRADES}`);
+  console.log(`Balance: PM $${(PM_BALANCE - pmSpent).toFixed(2)} / PF $${(PF_BALANCE - pfSpent).toFixed(2)}`);
   console.log(`───────────────────────────────────────────────────────────`);
 
   // Execute best opportunity
@@ -385,6 +413,26 @@ async function executeSpread(
   const totalCost = size * total;
   const expectedProfit = size * (1 - total);
 
+  // Check if we have enough balance
+  const pmOrderCost = type === "PM_UP_PF_DOWN" ? size * price1 : size * price2;
+  const pfOrderCost = type === "PM_UP_PF_DOWN" ? size * price2 : size * price1;
+  const pmRemaining = PM_BALANCE - pmSpent;
+  const pfRemaining = PF_BALANCE - pfSpent;
+
+  if (pmOrderCost > pmRemaining) {
+    console.log(`\n  Insufficient PM balance: need $${pmOrderCost.toFixed(2)}, have $${pmRemaining.toFixed(2)}`);
+    log(`SKIP: Insufficient PM balance (need $${pmOrderCost.toFixed(2)}, have $${pmRemaining.toFixed(2)})`);
+    pendingTrade = false;
+    return;
+  }
+
+  if (pfOrderCost > pfRemaining) {
+    console.log(`\n  Insufficient PF balance: need $${pfOrderCost.toFixed(2)}, have $${pfRemaining.toFixed(2)}`);
+    log(`SKIP: Insufficient PF balance (need $${pfOrderCost.toFixed(2)}, have $${pfRemaining.toFixed(2)})`);
+    pendingTrade = false;
+    return;
+  }
+
   console.log(`\n\x1B[42m\x1B[30m  EXECUTING CROSS-SPREAD  \x1B[0m`);
   console.log(`[${timestamp}] ${type}`);
   console.log(`  Size: ${size} shares`);
@@ -409,12 +457,16 @@ async function executeSpread(
 
       if (response?.orderID) {
         console.log(`        Order: ${response.orderID.slice(0, 16)}...`);
+        log(`PM order placed: ${response.orderID}`);
         order1Success = true;
+        pmSpent += pmOrderCost;
       } else {
-        console.log(`        Failed: ${JSON.stringify(response)}`);
+        console.log(`        Failed`);
+        logError("PM UP order", response);
       }
     } catch (error) {
-      console.log(`        Error: ${error}`);
+      console.log(`        Error`);
+      logError("PM UP order", error);
     }
 
     // Buy DOWN on predict.fun (by selling UP - but we do limit buy on DOWN)
@@ -431,15 +483,20 @@ async function executeSpread(
         const result = await pfClient.placeLimitOrder(pfMarket, downOutcome, Math.round(price2 * 100) / 100, size);
         if (result.success) {
           console.log(`        Order: ${result.orderId?.slice(0, 16)}...`);
+          log(`PF DOWN order placed: ${result.orderId}`);
           order2Success = true;
+          pfSpent += pfOrderCost;
         } else {
-          console.log(`        Failed: ${result.error}`);
+          console.log(`        Failed`);
+          logError("PF DOWN order", result.error);
         }
       } else {
         console.log(`        Failed: Down outcome not found`);
+        logError("PF DOWN order", "Down outcome not found in market");
       }
     } catch (error) {
-      console.log(`        Error: ${error}`);
+      console.log(`        Error`);
+      logError("PF DOWN order", error);
     }
   } else {
     // Buy UP on predict.fun
@@ -450,15 +507,20 @@ async function executeSpread(
         const result = await pfClient.placeLimitOrder(pfMarket, upOutcome, Math.round(price1 * 100) / 100, size);
         if (result.success) {
           console.log(`        Order: ${result.orderId?.slice(0, 16)}...`);
+          log(`PF UP order placed: ${result.orderId}`);
           order1Success = true;
+          pfSpent += pfOrderCost;
         } else {
-          console.log(`        Failed: ${result.error}`);
+          console.log(`        Failed`);
+          logError("PF UP order", result.error);
         }
       } else {
         console.log(`        Failed: Up outcome not found`);
+        logError("PF UP order", "Up outcome not found in market");
       }
     } catch (error) {
-      console.log(`        Error: ${error}`);
+      console.log(`        Error`);
+      logError("PF UP order", error);
     }
 
     // Buy DOWN on Polymarket
@@ -473,23 +535,30 @@ async function executeSpread(
 
       if (response?.orderID) {
         console.log(`        Order: ${response.orderID.slice(0, 16)}...`);
+        log(`PM DOWN order placed: ${response.orderID}`);
         order2Success = true;
+        pmSpent += pmOrderCost;
       } else {
-        console.log(`        Failed: ${JSON.stringify(response)}`);
+        console.log(`        Failed`);
+        logError("PM DOWN order", response);
       }
     } catch (error) {
-      console.log(`        Error: ${error}`);
+      console.log(`        Error`);
+      logError("PM DOWN order", error);
     }
   }
 
   if (order1Success && order2Success) {
     tradesExecuted++;
     console.log(`\n  SPREAD COMPLETE`);
+    log(`SPREAD COMPLETE: ${type}, size=${size}, cost=$${totalCost.toFixed(2)}, profit=$${expectedProfit.toFixed(2)}`);
   } else if (order1Success || order2Success) {
     console.log(`\n  PARTIAL - Only one leg filled!`);
+    log(`PARTIAL FILL: ${type}, order1=${order1Success}, order2=${order2Success}`);
     tradesExecuted++; // Still count it
   } else {
     console.log(`\n  BOTH ORDERS FAILED`);
+    log(`BOTH FAILED: ${type}`);
   }
 
   setTimeout(() => { pendingTrade = false; }, COOLDOWN_MS);
@@ -497,6 +566,8 @@ async function executeSpread(
 
 async function main() {
   console.log("Initializing Cross-Platform Spread Bot...\n");
+  console.log(`Log file: ${LOG_FILE}\n`);
+  log("=== Bot started ===");
 
   // Initialize predict.fun
   console.log("1. Initializing predict.fun...");
