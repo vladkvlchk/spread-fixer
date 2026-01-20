@@ -53,8 +53,8 @@ async function sendTelegram(message: string): Promise<boolean> {
 }
 
 async function checkLowBalance() {
-  const pmRemaining = PM_BALANCE - pmSpent;
-  const pfRemaining = PF_BALANCE - pfSpent;
+  const pmRemaining = pmBalance - pmSpent;
+  const pfRemaining = pfBalance - pfSpent;
 
   if (pmRemaining < LOW_BALANCE_THRESHOLD && !lowBalanceAlertSent.pm) {
     lowBalanceAlertSent.pm = true;
@@ -85,8 +85,10 @@ function logError(context: string, error: unknown) {
   console.log(`  [logged to cross-spread.log]`);
 }
 import { createClient, type Market, type PredictClient } from "../lib/client";
-import { ClobClient, Side, type TickSize } from "@polymarket/clob-client";
+import { ClobClient, Side, AssetType, type TickSize } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
+import { Wallet as EthersWallet } from "ethers";
+import { OrderBuilder, ChainId } from "@predictdotfun/sdk";
 
 const PF_WS_URL = "wss://ws.predict.fun/ws";
 const CLOB_HOST = "https://clob.polymarket.com";
@@ -99,18 +101,67 @@ const MIN_ORDER_VALUE = 1; // $1 minimum order value
 const MAX_TRADES = 15; // Max number of spread trades per session
 const COOLDOWN_MS = 5000; // Cooldown between trades
 
-// Available balance on each platform (update manually)
-const PM_BALANCE = 53; // Polymarket USDC balance
-const PF_BALANCE = 108; // predict.fun USDC balance
+// Available balance on each platform (fetched automatically)
+let pmBalance = 0; // Polymarket USDC balance
+let pfBalance = 0; // predict.fun USDC balance
 
-// Track spent amounts
+// Track spent amounts (reset when balance is refreshed)
 let pmSpent = 0;
 let pfSpent = 0;
+
+// Fetch real balances from both platforms
+async function fetchBalances(): Promise<void> {
+  // Fetch Polymarket balance
+  try {
+    const privateKey = process.env.POLYMARKET_PRIVATE_KEY;
+    const funderAddress = process.env.POLYMARKET_FUNDER_ADDRESS;
+
+    if (privateKey && funderAddress) {
+      const wallet = new Wallet(privateKey);
+      const tempClient = new ClobClient(CLOB_HOST, CHAIN_ID, wallet);
+      const creds = await tempClient.createOrDeriveApiKey();
+
+      const client = new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds, 2, funderAddress);
+      const balanceData = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+
+      let balance = parseFloat(balanceData?.balance || "0");
+      if (balance > 1_000_000) balance = balance / 1e6; // Handle wei format
+
+      pmBalance = balance;
+      pmSpent = 0; // Reset spent tracking on balance refresh
+    }
+  } catch {
+    // Keep existing balance on error
+  }
+
+  // Fetch predict.fun balance
+  try {
+    const predictAccount = process.env.PREDICTFUN_ADDRESS;
+    let privyKey = process.env.PREDICTFUN_PRIVYWALLET_KEY;
+
+    if (predictAccount && privyKey) {
+      if (!privyKey.startsWith("0x")) privyKey = "0x" + privyKey;
+
+      const signer = new EthersWallet(privyKey);
+      const orderBuilder = await OrderBuilder.make(ChainId.BnbMainnet, signer, { predictAccount });
+      const balanceWei = await orderBuilder.balanceOf();
+
+      pfBalance = Number(balanceWei) / 1e18;
+      pfSpent = 0; // Reset spent tracking on balance refresh
+    }
+  } catch {
+    // Keep existing balance on error
+  }
+
+  log(`Balance refresh: PM $${pmBalance.toFixed(2)}, PF $${pfBalance.toFixed(2)}`);
+}
 
 // Polymarket state
 let pmClient: ClobClient | null = null;
 let pmUpAsk: number | null = null;
 let pmDownAsk: number | null = null;
+let pmUpAskSize: number | null = null;  // Liquidity at best ask
+let pmDownAskSize: number | null = null;
 let pmUpTokenId: string | null = null;
 let pmDownTokenId: string | null = null;
 let pmTickSize: TickSize = "0.01";
@@ -123,6 +174,8 @@ let pfMarket: Market | null = null;
 let pfMarketId: number | null = null;
 let pfUpAsk: number | null = null;
 let pfDownAsk: number | null = null;
+let pfUpAskSize: number | null = null;  // Liquidity at best ask
+let pfDownAskSize: number | null = null;
 let pfWs: WebSocket | null = null;
 let pfRequestId = 1;
 
@@ -265,12 +318,16 @@ function connectPredictFunWS() {
   pfWs = new WebSocket(wsUrl);
 
   pfWs.on("open", () => {
-    const subscribeMsg = {
-      method: "subscribe",
-      requestId: pfRequestId++,
-      params: [`predictOrderbook/${pfMarketId}`]
-    };
-    pfWs!.send(JSON.stringify(subscribeMsg));
+    // Wait a tick for readyState to update
+    setTimeout(() => {
+      if (pfWs?.readyState !== WebSocket.OPEN) return;
+      const subscribeMsg = {
+        method: "subscribe",
+        requestId: pfRequestId++,
+        params: [`predictOrderbook/${pfMarketId}`]
+      };
+      pfWs.send(JSON.stringify(subscribeMsg));
+    }, 50);
   });
 
   pfWs.on("message", (data) => {
@@ -278,7 +335,9 @@ function connectPredictFunWS() {
       const msg = JSON.parse(data.toString());
 
       if (msg.type === "M" && msg.topic === "heartbeat") {
-        pfWs!.send(JSON.stringify({ method: "heartbeat", data: msg.data }));
+        if (pfWs?.readyState === WebSocket.OPEN) {
+          pfWs.send(JSON.stringify({ method: "heartbeat", data: msg.data }));
+        }
         return;
       }
 
@@ -304,25 +363,35 @@ function updatePredictFunOrderbook(data: { bids?: [number, number][]; asks?: [nu
   const bids = data.bids;
   const asks = data.asks;
 
-  // Best bid (highest)
+  // Best bid (highest) - for DOWN calculation
   let bestBid: number | null = null;
-  for (const [price] of bids) {
-    if (bestBid === null || price > bestBid) bestBid = price;
+  let bestBidSize: number | null = null;
+  for (const [price, size] of bids) {
+    if (bestBid === null || price > bestBid) {
+      bestBid = price;
+      bestBidSize = size;
+    }
   }
 
-  // Best ask (lowest)
+  // Best ask (lowest) - for UP
   let bestAsk: number | null = null;
-  for (const [price] of asks) {
-    if (bestAsk === null || price < bestAsk) bestAsk = price;
+  let bestAskSize: number | null = null;
+  for (const [price, size] of asks) {
+    if (bestAsk === null || price < bestAsk) {
+      bestAsk = price;
+      bestAskSize = size;
+    }
   }
 
   // This is UP (Yes) orderbook
   pfUpAsk = bestAsk;
+  pfUpAskSize = bestAskSize;
 
   // Binary market: DOWN = 1 - UP
   // DOWN ask = 1 - UP bid (to buy DOWN, someone sells UP)
   if (bestBid !== null) {
     pfDownAsk = Math.round((1 - bestBid) * 100) / 100;
+    pfDownAskSize = bestBidSize; // Size at the bid = liquidity for DOWN
   }
 }
 
@@ -333,8 +402,11 @@ function connectPolymarketWS() {
   pmWs = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
 
   pmWs.on("open", () => {
-    pmWs!.send(JSON.stringify({ type: "Market", assets_ids: [pmUpTokenId] }));
-    pmWs!.send(JSON.stringify({ type: "Market", assets_ids: [pmDownTokenId] }));
+    setTimeout(() => {
+      if (pmWs?.readyState !== WebSocket.OPEN) return;
+      pmWs.send(JSON.stringify({ type: "Market", assets_ids: [pmUpTokenId] }));
+      pmWs.send(JSON.stringify({ type: "Market", assets_ids: [pmDownTokenId] }));
+    }, 50);
   });
 
   pmWs.on("message", (data) => {
@@ -351,8 +423,10 @@ function connectPolymarketWS() {
         for (const change of msg.price_changes) {
           if (change.asset_id === pmUpTokenId) {
             if (change.best_ask) pmUpAsk = parseFloat(change.best_ask);
+            if (change.best_ask_size) pmUpAskSize = parseFloat(change.best_ask_size);
           } else if (change.asset_id === pmDownTokenId) {
             if (change.best_ask) pmDownAsk = parseFloat(change.best_ask);
+            if (change.best_ask_size) pmDownAskSize = parseFloat(change.best_ask_size);
           }
         }
         checkAndExecute();
@@ -372,23 +446,85 @@ function connectPolymarketWS() {
   pmWs.on("close", () => setTimeout(connectPolymarketWS, 5000));
 }
 
-function updatePolymarketBook(book: { asset_id?: string; bids?: Array<{ price: string }>; asks?: Array<{ price: string }> }) {
+function updatePolymarketBook(book: { asset_id?: string; bids?: Array<{ price: string; size: string }>; asks?: Array<{ price: string; size: string }> }) {
   const assetId = book.asset_id;
   if (!assetId) return;
 
   const asks = book.asks || [];
 
-  // Best ask (lowest)
+  // Best ask (lowest) with size
   let bestAsk: number | null = null;
+  let bestAskSize: number | null = null;
   for (const ask of asks) {
     const price = parseFloat(ask.price);
-    if (bestAsk === null || price < bestAsk) bestAsk = price;
+    if (bestAsk === null || price < bestAsk) {
+      bestAsk = price;
+      bestAskSize = parseFloat(ask.size || "0");
+    }
   }
 
   if (assetId === pmUpTokenId) {
     pmUpAsk = bestAsk;
+    pmUpAskSize = bestAskSize;
   } else if (assetId === pmDownTokenId) {
     pmDownAsk = bestAsk;
+    pmDownAskSize = bestAskSize;
+  }
+}
+
+// Fetch Polymarket orderbook via REST API to get sizes
+async function fetchPolymarketOrderbooks() {
+  if (!pmUpTokenId || !pmDownTokenId) return;
+
+  try {
+    // Fetch UP orderbook
+    const upRes = await fetch(`https://clob.polymarket.com/book?token_id=${pmUpTokenId}`);
+    // DEBUG: log once
+    if (pmUpAskSize === null) log(`Fetching PM orderbooks... UP status: ${upRes.status}`);
+    if (upRes.ok) {
+      const upBook = await upRes.json() as { asks?: Array<{ price: string; size: string }> };
+      if (upBook.asks && upBook.asks.length > 0) {
+        // Find best ask (lowest price)
+        let bestAsk: number | null = null;
+        let bestAskSize: number | null = null;
+        for (const ask of upBook.asks) {
+          const price = parseFloat(ask.price);
+          if (bestAsk === null || price < bestAsk) {
+            bestAsk = price;
+            bestAskSize = parseFloat(ask.size || "0");
+          }
+        }
+        if (bestAsk !== null) {
+          pmUpAsk = bestAsk;
+          pmUpAskSize = bestAskSize;
+        }
+      }
+    }
+
+    // Fetch DOWN orderbook
+    const downRes = await fetch(`https://clob.polymarket.com/book?token_id=${pmDownTokenId}`);
+    // DEBUG: log once
+    if (pmDownAskSize === null) log(`Fetching PM DOWN orderbook... status: ${downRes.status}`);
+    if (downRes.ok) {
+      const downBook = await downRes.json() as { asks?: Array<{ price: string; size: string }> };
+      if (downBook.asks && downBook.asks.length > 0) {
+        let bestAsk: number | null = null;
+        let bestAskSize: number | null = null;
+        for (const ask of downBook.asks) {
+          const price = parseFloat(ask.price);
+          if (bestAsk === null || price < bestAsk) {
+            bestAsk = price;
+            bestAskSize = parseFloat(ask.size || "0");
+          }
+        }
+        if (bestAsk !== null) {
+          pmDownAsk = bestAsk;
+          pmDownAskSize = bestAskSize;
+        }
+      }
+    }
+  } catch {
+    // Ignore fetch errors
   }
 }
 
@@ -439,35 +575,49 @@ async function checkAndExecute() {
     console.log(`\n\x1B[43m\x1B[30m  ⏳ WAITING FOR MARKETS TO SYNC - NO TRADING  \x1B[0m`);
     console.log(`\nBoth platforms must be on the same 15-minute window.`);
     console.log(`Trades: ${tradesExecuted}/${MAX_TRADES}`);
-    console.log(`Balance: PM $${(PM_BALANCE - pmSpent).toFixed(2)} / PF $${(PF_BALANCE - pfSpent).toFixed(2)}`);
+    console.log(`Balance: PM $${(pmBalance - pmSpent).toFixed(2)} / PF $${(pfBalance - pfSpent).toFixed(2)}`);
     return;
   }
 
+  // Format with size
+  const fmtWithSize = (p: number | null, s: number | null) => {
+    if (p === null) return "  ?  ";
+    const price = `${(p * 100).toFixed(1)}¢`;
+    const size = s !== null ? `(${Math.floor(s)})` : "(?)";
+    return `${price}${size}`.padEnd(12);
+  };
+
   console.log(`                      UP              DOWN`);
   console.log(`───────────────────────────────────────────────────────────`);
-  console.log(`Polymarket ASK   ${fmt(pmUpAsk)}            ${fmt(pmDownAsk)}`);
-  console.log(`predict.fun ASK  ${fmt(pfUpAsk)}            ${fmt(pfDownAsk)}`);
+  console.log(`Polymarket ASK   ${fmtWithSize(pmUpAsk, pmUpAskSize)}    ${fmtWithSize(pmDownAsk, pmDownAskSize)}`);
+  console.log(`predict.fun ASK  ${fmtWithSize(pfUpAsk, pfUpAskSize)}    ${fmtWithSize(pfDownAsk, pfDownAskSize)}`);
   console.log(`───────────────────────────────────────────────────────────`);
 
   console.log(`\nCross-Spread Opportunities (need >= ${MIN_PROFIT_CENTS}¢):`);
 
+  // Calculate minimum liquidity for each spread
+  const minLiq1 = spread1 ? Math.min(pmUpAskSize || 0, pfDownAskSize || 0) : 0;
+  const minLiq2 = spread2 ? Math.min(pfUpAskSize || 0, pmDownAskSize || 0) : 0;
+
   if (spread1) {
     const color = spread1.profit >= MIN_PROFIT_CENTS ? '\x1B[32m' : '\x1B[33m';
-    console.log(`  ${color}PM UP ${fmt(spread1.pmUp)} + PF DOWN ${fmt(spread1.pfDown)} = ${(spread1.total * 100).toFixed(1)}¢ → +${spread1.profit.toFixed(1)}¢\x1B[0m`);
+    const liqInfo = minLiq1 > 0 ? ` [${Math.floor(minLiq1)} avail]` : ' [no liq]';
+    console.log(`  ${color}PM UP ${fmt(spread1.pmUp)} + PF DOWN ${fmt(spread1.pfDown)} = ${(spread1.total * 100).toFixed(1)}¢ → +${spread1.profit.toFixed(1)}¢${liqInfo}\x1B[0m`);
   } else {
     console.log(`  PM UP + PF DOWN: No opportunity`);
   }
 
   if (spread2) {
     const color = spread2.profit >= MIN_PROFIT_CENTS ? '\x1B[32m' : '\x1B[33m';
-    console.log(`  ${color}PF UP ${fmt(spread2.pfUp)} + PM DOWN ${fmt(spread2.pmDown)} = ${(spread2.total * 100).toFixed(1)}¢ → +${spread2.profit.toFixed(1)}¢\x1B[0m`);
+    const liqInfo = minLiq2 > 0 ? ` [${Math.floor(minLiq2)} avail]` : ' [no liq]';
+    console.log(`  ${color}PF UP ${fmt(spread2.pfUp)} + PM DOWN ${fmt(spread2.pmDown)} = ${(spread2.total * 100).toFixed(1)}¢ → +${spread2.profit.toFixed(1)}¢${liqInfo}\x1B[0m`);
   } else {
     console.log(`  PF UP + PM DOWN: No opportunity`);
   }
 
   console.log(`───────────────────────────────────────────────────────────`);
   console.log(`Trades: ${tradesExecuted}/${MAX_TRADES}`);
-  console.log(`Balance: PM $${(PM_BALANCE - pmSpent).toFixed(2)} / PF $${(PF_BALANCE - pfSpent).toFixed(2)}`);
+  console.log(`Balance: PM $${(pmBalance - pmSpent).toFixed(2)} / PF $${(pfBalance - pfSpent).toFixed(2)}`);
   console.log(`───────────────────────────────────────────────────────────`);
 
   // Show status message based on state
@@ -487,15 +637,15 @@ async function checkAndExecute() {
   }
 
   // Execute best opportunity (only if we can trade)
-  if (canTrade && spread1 && spread1.profit >= MIN_PROFIT_CENTS) {
+  if (canTrade && spread1 && spread1.profit >= MIN_PROFIT_CENTS && minLiq1 >= 5) {
     if (!spread2 || spread1.profit >= spread2.profit) {
-      await executeSpread("PM_UP_PF_DOWN", spread1.pmUp, spread1.pfDown, spread1.profit);
+      await executeSpread("PM_UP_PF_DOWN", spread1.pmUp, spread1.pfDown, spread1.profit, minLiq1);
       return;
     }
   }
 
-  if (canTrade && spread2 && spread2.profit >= MIN_PROFIT_CENTS) {
-    await executeSpread("PF_UP_PM_DOWN", spread2.pfUp, spread2.pmDown, spread2.profit);
+  if (canTrade && spread2 && spread2.profit >= MIN_PROFIT_CENTS && minLiq2 >= 5) {
+    await executeSpread("PF_UP_PM_DOWN", spread2.pfUp, spread2.pmDown, spread2.profit, minLiq2);
     return;
   }
 
@@ -507,7 +657,8 @@ async function executeSpread(
   type: "PM_UP_PF_DOWN" | "PF_UP_PM_DOWN",
   price1: number,
   price2: number,
-  profit: number
+  profit: number,
+  availableLiquidity: number
 ) {
   if (!pfClient || !pfMarket || !pmClient) return;
 
@@ -518,12 +669,24 @@ async function executeSpread(
   // Calculate size so BOTH orders meet minimums:
   // - Polymarket: min 5 shares AND min $1
   // - predict.fun: min $1
+  // - Cap at available liquidity
   const PM_MIN_SHARES = 5;
-  const size = Math.max(
+  const minSize = Math.max(
     PM_MIN_SHARES,
     Math.ceil(MIN_ORDER_VALUE / price1),
     Math.ceil(MIN_ORDER_VALUE / price2)
   );
+
+  // Trade small amounts close to minimum, but verify liquidity exists
+  const size = minSize + 2; // Small buffer above minimum
+
+  if (availableLiquidity < size) {
+    console.log(`\n  Insufficient liquidity: need ${size} shares, available ${Math.floor(availableLiquidity)}`);
+    log(`SKIP: Insufficient liquidity (need ${size}, have ${Math.floor(availableLiquidity)})`);
+    pendingTrade = false;
+    setTimeout(() => { pendingTrade = false; }, COOLDOWN_MS);
+    return;
+  }
 
   const total = price1 + price2;
   const totalCost = size * total;
@@ -532,8 +695,8 @@ async function executeSpread(
   // Check if we have enough balance
   const pmOrderCost = type === "PM_UP_PF_DOWN" ? size * price1 : size * price2;
   const pfOrderCost = type === "PM_UP_PF_DOWN" ? size * price2 : size * price1;
-  const pmRemaining = PM_BALANCE - pmSpent;
-  const pfRemaining = PF_BALANCE - pfSpent;
+  const pmRemaining = pmBalance - pmSpent;
+  const pfRemaining = pfBalance - pfSpent;
 
   if (pmOrderCost > pmRemaining) {
     console.log(`\n  Insufficient PM balance: need $${pmOrderCost.toFixed(2)}, have $${pmRemaining.toFixed(2)}`);
@@ -687,6 +850,11 @@ async function main() {
   console.log(`Log file: ${LOG_FILE}\n`);
   log("=== Bot started ===");
 
+  // Fetch initial balances
+  console.log("0. Fetching balances...");
+  await fetchBalances();
+  console.log(`   PM: $${pmBalance.toFixed(2)}, PF: $${pfBalance.toFixed(2)}`);
+
   // Initialize predict.fun
   console.log("1. Initializing predict.fun...");
   pfClient = await createClient();
@@ -724,6 +892,15 @@ async function main() {
   connectPolymarketWS();
   connectPredictFunWS();
   console.log("   Connected\n");
+
+  // Fetch initial orderbook sizes
+  await fetchPolymarketOrderbooks();
+
+  // Fetch Polymarket orderbooks every 2 seconds to get accurate sizes
+  setInterval(fetchPolymarketOrderbooks, 2000);
+
+  // Refresh balances every minute
+  setInterval(fetchBalances, 60000);
 
   // Refresh markets every 15 seconds to detect new 15-minute windows quickly
   setInterval(async () => {

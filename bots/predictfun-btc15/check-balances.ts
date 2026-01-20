@@ -10,7 +10,8 @@ config({ path: ".env.local" });
 
 import { ClobClient, AssetType } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
-import { createClient } from "./lib/client";
+import { Wallet as EthersWallet } from "ethers";
+import { OrderBuilder, ChainId } from "@predictdotfun/sdk";
 
 const CLOB_HOST = "https://clob.polymarket.com";
 const CHAIN_ID = 137;
@@ -54,35 +55,28 @@ async function checkPolymarketBalance(): Promise<number | null> {
 }
 
 async function checkPredictFunBalance(): Promise<number | null> {
+  const predictAccount = process.env.PREDICTFUN_ADDRESS;
+  let privyKey = process.env.PREDICTFUN_PRIVYWALLET_KEY;
+
+  if (!predictAccount || !privyKey) {
+    console.log("  Missing PREDICTFUN_ADDRESS or PREDICTFUN_PRIVYWALLET_KEY");
+    return null;
+  }
+
   try {
-    // Use the existing client which handles auth
-    const client = await createClient();
-
-    // Try to get balance via authenticated API
-    const res = await fetch("https://api.predict.fun/v1/users/me/balance", {
-      headers: client.getHeaders(),
-    });
-
-    if (!res.ok) {
-      // Try alternative endpoint
-      const res2 = await fetch("https://api.predict.fun/v1/account/balance", {
-        headers: client.getHeaders(),
-      });
-
-      if (res2.ok) {
-        const data = await res2.json() as { data?: { balance?: string; available?: string } };
-        const balanceStr = data.data?.available || data.data?.balance || "0";
-        return parseFloat(balanceStr);
-      }
-
-      console.log(`  API returned ${res.status}`);
-      console.log(`  Check balance at: https://predict.fun/portfolio`);
-      return null;
+    // Normalize the key (add 0x if missing)
+    if (!privyKey.startsWith("0x")) {
+      privyKey = "0x" + privyKey;
     }
 
-    const data = await res.json() as { data?: { balance?: string; available?: string } };
-    const balanceStr = data.data?.available || data.data?.balance || "0";
-    return parseFloat(balanceStr);
+    const signer = new EthersWallet(privyKey);
+    const orderBuilder = await OrderBuilder.make(ChainId.BnbMainnet, signer, { predictAccount });
+
+    // Get balance in wei (USDT has 18 decimals)
+    const balanceWei = await orderBuilder.balanceOf();
+    const balance = Number(balanceWei) / 1e18;
+
+    return balance;
   } catch (error) {
     console.log(`  Error: ${error}`);
     console.log(`  Check balance at: https://predict.fun/portfolio`);
